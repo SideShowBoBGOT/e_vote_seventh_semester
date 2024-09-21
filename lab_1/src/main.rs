@@ -1,24 +1,12 @@
 use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
-
-
+use crate::rsa::RSA;
 
 mod rsa {
+    use std::ops::Mul;
     use rand::Rng;
     pub use inner::RSA;
-
-    fn generate_big_prime() -> u32 {
-        let mut rng = rand::thread_rng();
-        const MIN_LIMIT: u32 = 1 << 31;
-        const MAX_LIMIT: u32 = 1 << 32 - 1;
-        loop {
-            let num: u32 = rng.gen_range(MIN_LIMIT..MAX_LIMIT);
-            if is_prime(num) {
-                return num;
-            }
-        }
-    }
 
     fn is_prime(n: u32) -> bool {
         if n < 2 {
@@ -31,6 +19,60 @@ mod rsa {
         }
         true
     }
+
+    mod big_nums {
+        use std::ops::Mul;
+        use rand::Rng;
+        use super::is_prime;
+
+        // Number between 2^31..(2^32 - 1)
+        pub struct BigU32(u32);
+
+        // Number between (2^31 - 1)..((2^32 - 1) - 1)
+        pub struct BigDecU32(u32);
+
+        impl Mul for BigU32 {
+            type Output = BigU64;
+
+            fn mul(self, rhs: Self) -> Self::Output {
+                self.0 * rhs.0
+            }
+        }
+
+        impl BigU32 {
+            pub fn dec(self) -> BigDecU32 {
+                BigDecU32(self.0 - 1)
+            }
+
+            pub fn value(self) -> u32 {
+                self.0
+            }
+        }
+
+        pub struct BigU64(u64);
+
+        impl BigU64 {
+            pub fn value(self) -> u64 {
+                self.0
+            }
+        }
+
+        pub fn generate_big_prime() -> BigU32 {
+            let mut rng = rand::thread_rng();
+            const MIN_LIMIT: u32 = 1 << 31;
+            const MAX_LIMIT: u32 = 1 << 32 - 1;
+            loop {
+                let num: u32 = rng.gen_range(MIN_LIMIT..MAX_LIMIT);
+                if is_prime(num) {
+                    return BigU32(num);
+                }
+            }
+        }
+    }
+
+
+
+
 
     fn extended_gcd(a: u64, b: u64) -> (u64, u64, u64) {
         if a == 0 {
@@ -55,6 +97,9 @@ mod rsa {
     mod inner {
         use crate::rsa::{generate_big_prime, mod_inverse};
 
+        #[derive(Debug, Copy, Clone)]
+        pub struct MessageHash(u64);
+
         pub struct RSA {
             n: u64,
             e: u64,
@@ -65,12 +110,12 @@ mod rsa {
             pub fn new() -> Self {
                 loop {
                     let (e, n, phi) = loop {
-                        let p = generate_big_prime() as u64;
-                        let q = generate_big_prime() as u64;
+                        let p = generate_big_prime();
+                        let q = generate_big_prime();
                         let n = p * q;
                         let phi = (p - 1) * (q - 1);
-                        let e = generate_big_prime() as u64;
-                        if e < phi {
+                        let e = generate_big_prime();
+                        if (e as u64) < phi {
                             break (e, n, phi)
                         }
                     };
@@ -80,28 +125,15 @@ mod rsa {
                 }
             }
 
-            pub fn hash(&self, msg: &str) -> u64 {
-                msg.chars().fold(0u64, |acc, x| (acc + x as u64).pow(2) % self.n)
+            pub fn hash(&self, msg: &str) -> MessageHash {
+                MessageHash(msg.chars().fold(0u64, |acc, x| (acc + x as u64).pow(2) % self.n))
+            }
+
+            pub fn sign(&self, hash: MessageHash) -> u64 {
+                hash.0.pow(self.d) % self.n
             }
         }
     }
-}
-
-
-
-
-fn mod_pow(base: u64, exponent: u64, modulus: u64) -> u64 {
-    let mut result = 1;
-    let mut base = base % modulus;
-    let mut exp = exponent;
-    while exp > 0 {
-        if exp % 2 == 1 {
-            result = (result * base) % modulus;
-        }
-        exp = exp >> 1;
-        base = (base * base) % modulus;
-    }
-    result
 }
 
 fn gamming_cipher(message: &str, key: &str) -> String {
@@ -138,8 +170,6 @@ impl VoterState {
         }
     }
 }
-
-
 
 impl Voter {
     fn new(name: &str, has_right_to_vote: bool) -> Self {

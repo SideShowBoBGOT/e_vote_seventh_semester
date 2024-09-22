@@ -4,6 +4,7 @@ use thiserror::Error;
 
 mod rsa {
     use rand::Rng;
+    pub use keys::{KeyPair, PublicKey, PrivateKey};
 
     fn generate_num(predicate: fn(u16) -> bool) -> u16 {
         let mut rng = rand::thread_rng();
@@ -77,7 +78,7 @@ mod rsa {
     mod keys {
         use crate::rsa::{calc_multiplier_mod_1, generate_prime, generate_uneven, mod_pow};
 
-        struct PrivateKey {
+        pub struct PrivateKey {
             d: u32,
             n: u32
         }
@@ -88,7 +89,7 @@ mod rsa {
             }
         }
 
-        struct PublicKey {
+        pub struct PublicKey {
             e: u16,
             n: u32
         }
@@ -186,46 +187,55 @@ mod rsa {
 fn gamming_cipher(message: &[u8], key: &[u8]) -> Vec<u8> {
     message.iter().zip(key.iter().cycle()).map(|(m, k)| m ^ k).collect()
 }
-//
-// #[derive(Default)]
-// struct VoterData {
-//     name: String,
-//     rsa: RSA
-// }
-//
-// enum VoterState {
-//     CanVote(VoterData),
-//     CanNotVote(VoterData),
-//     Voted(VoterData),
-// }
-//
-// #[derive(Debug)]
-// enum VoteError {
-//     CanNotVote,
-//     AlreadyVoted,
-// }
-//
-// impl VoterState {
-//     fn vote(&mut self, candidate: &str) -> Result<(), VoteError> {
-//         match self {
-//             VoterState::CanVote(voter) => {
-//                 let mut rng = rand::thread_rng();
-//
-//                 let key: Vec<u8> = (0..16).map(|_| rng.gen_range(0..u8::MAX)).collect();
-//                 let encrypted_vote = gamming_cipher(candidate.as_bytes(), &key);
-//
-//
-//                 let signature = voter.rsa.encrypt(voter.rsa.quad_fold_hash(&encrypted_vote));
-//
-//
-//                 *self = VoterState::Voted(std::mem::take(voter));
-//                 Ok(())
-//             },
-//             VoterState::CanNotVote(_) => Err(VoteError::CanNotVote),
-//             VoterState::Voted(_) => Err(VoteError::AlreadyVoted),
-//         }
-//     }
-// }
+
+#[derive(Default)]
+struct VoterData {
+    name: String,
+    key_pair: rsa::KeyPair
+}
+
+enum VoterState {
+    CanVote(VoterData),
+    CanNotVote(VoterData),
+    Voted(VoterData),
+}
+
+#[derive(Debug)]
+enum VoteError {
+    CanNotVote,
+    AlreadyVoted,
+}
+
+struct VoteData {
+    encrypted_gamming_key: u64,
+    rsa_signature: u64,
+    gammed_vote: Vec<u8>
+}
+
+impl VoterState {
+    fn vote(&mut self, candidate: &str, cec_public_key: rsa::PublicKey) -> Result<VoteData, VoteError> {
+        match self {
+            VoterState::CanVote(voter) => {
+                let mut rng = rand::thread_rng();
+                let mut gamming_key: [u8; 8] = Default::default();
+                for e in &mut gamming_key {
+                    *e = rng.gen_range(0..u8::MAX)
+                }
+
+                let gammed_vote = gamming_cipher(candidate.as_bytes(), &gamming_key);
+                let gammed_vote_hash = voter.key_pair.quad_fold_hash(&gammed_vote);
+
+                let rsa_signature = voter.key_pair.get_private_key().apply(gammed_vote_hash);
+                let encrypted_gamming_key = cec_public_key.apply(u64::from_le_bytes(gamming_key));
+
+                *self = VoterState::Voted(std::mem::take(voter));
+                Ok(VoteData { encrypted_gamming_key, rsa_signature, gammed_vote })
+            },
+            VoterState::CanNotVote(_) => Err(VoteError::CanNotVote),
+            VoterState::Voted(_) => Err(VoteError::AlreadyVoted),
+        }
+    }
+}
 //
 // impl Voter {
 //     fn new(name: &str, has_right_to_vote: bool) -> Self {

@@ -79,8 +79,8 @@ mod rsa {
     mod inner {
         use crate::rsa::{generate_prime, generate_uneven, calc_multiplier_mod_1, mod_pow};
 
-        #[derive(Debug, Copy, Clone)]
-        pub struct MessageHash(u32);
+        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+        pub struct MessageHash(u64);
 
         #[derive(Debug, Copy, Clone)]
         pub struct Signature(u64);
@@ -109,15 +109,17 @@ mod rsa {
             }
 
             pub fn hash(&self, msg: &str) -> MessageHash {
-                MessageHash(msg.chars().fold(0u32, |acc, x| (acc + x as u32).pow(2) % self.n))
+                MessageHash(msg.chars().fold(0u64, |acc, x| {
+                    mod_pow(acc + x as u64, 2u64, self.n as u64)
+                }))
             }
 
             pub fn sign(&self, hash: MessageHash) -> Signature {
-                Signature(mod_pow(hash.0 as u64, self.d as u64, self.n as u64))
+                Signature(mod_pow(hash.0, self.d as u64, self.n as u64))
             }
 
-            pub fn verify_signature(&self, signature: Signature) -> bool {
-                mod_pow(signature.0, self.e as u64, self.n as u64) == signature.0
+            pub fn verify_signature(&self, signature: Signature, hash: MessageHash) -> bool {
+                MessageHash(mod_pow(signature.0, self.e as u64, self.n as u64)) == hash
             }
         }
 
@@ -130,15 +132,20 @@ mod rsa {
                 let r = RSA::new();
                 println!("{:?}", r);
             }
+
+            #[test]
+            fn test_sign_verify() {
+                let r = RSA::new();
+                let message = r.hash("message");
+                let signature = r.sign(message);
+                assert!(r.verify_signature(signature, message));
+            }
         }
     }
 
     #[cfg(test)]
     mod tests {
         use crate::rsa::{calc_multiplier_mod_1, mod_pow};
-
-        #[test]
-
 
         #[test]
         fn test_mod_inverse() {

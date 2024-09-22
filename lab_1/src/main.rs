@@ -1,11 +1,9 @@
 use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
-use crate::rsa::RSA;
 
 mod rsa {
     use rand::Rng;
-    pub use inner::RSA;
 
     fn generate_num(predicate: fn(u16) -> bool) -> u16 {
         let mut rng = rand::thread_rng();
@@ -76,23 +74,46 @@ mod rsa {
         result
     }
 
-    mod inner {
-        use crate::rsa::{generate_prime, generate_uneven, calc_multiplier_mod_1, mod_pow};
+    mod keys {
+        use crate::rsa::{calc_multiplier_mod_1, generate_prime, generate_uneven, mod_pow};
 
-        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-        pub struct MessageHash(u64);
+        struct PrivateKey {
+            d: u32,
+            n: u32
+        }
 
-        #[derive(Debug, Copy, Clone)]
-        pub struct Signature(u64);
+        impl PrivateKey {
+            pub fn apply(&self, data: u64) -> u64 {
+                mod_pow(data, self.d as u64, self.n as u64)
+            }
+        }
+
+        struct PublicKey {
+            e: u16,
+            n: u32
+        }
+
+        impl PublicKey {
+            pub fn apply(&self, data: u64) -> u64 {
+                mod_pow(data, self.e as u64, self.n as u64)
+            }
+        }
 
         #[derive(Debug, Clone)]
-        pub struct RSA {
+        pub struct KeyPair {
             n: u32,
             e: u16,
             d: u32,
         }
 
-        impl RSA {
+        impl Default for KeyPair {
+            fn default() -> Self {
+                // default p = q = 3
+                Self { n: 9, e: 3, d: 3 }
+            }
+        }
+
+        impl KeyPair {
             pub fn new() -> Self {
                 loop {
                     let p = generate_prime() as u32;
@@ -108,37 +129,34 @@ mod rsa {
                 }
             }
 
-            pub fn hash(&self, msg: &str) -> MessageHash {
-                MessageHash(msg.chars().fold(0u64, |acc, x| {
-                    mod_pow(acc + x as u64, 2u64, self.n as u64)
-                }))
+            pub fn quad_fold_hash(&self, data: &[u8]) -> u64 {
+                data.iter().fold(0u64, |acc, x| {
+                    mod_pow(acc + (*x as u64), 2u64, self.n as u64)
+                })
             }
 
-            pub fn sign(&self, hash: MessageHash) -> Signature {
-                Signature(mod_pow(hash.0, self.d as u64, self.n as u64))
+            pub fn get_private_key(&self) -> PrivateKey {
+                PrivateKey { n: self.n, d: self.d }
             }
 
-            pub fn verify_signature(&self, signature: Signature, hash: MessageHash) -> bool {
-                MessageHash(mod_pow(signature.0, self.e as u64, self.n as u64)) == hash
+            pub fn get_public_key(&self) -> PublicKey {
+                PublicKey { n: self.n, e: self.e }
             }
         }
-
         #[cfg(test)]
         mod tests {
-            use crate::rsa::RSA;
-
-            #[test]
-            fn test_rsa() {
-                let r = RSA::new();
-                println!("{:?}", r);
-            }
+            use super::KeyPair;
 
             #[test]
             fn test_sign_verify() {
-                let r = RSA::new();
-                let message = r.hash("message");
-                let signature = r.sign(message);
-                assert!(r.verify_signature(signature, message));
+                let r = KeyPair::new();
+                let message_hash = r.quad_fold_hash("message".as_bytes());
+
+                let encrypted_hash = r.get_private_key().apply(message_hash);
+                assert_eq!(r.get_public_key().apply(encrypted_hash), message_hash);
+
+                let encrypted_hash = r.get_public_key().apply(message_hash);
+                assert_eq!(r.get_private_key().apply(encrypted_hash), message_hash);
             }
         }
     }
@@ -165,14 +183,11 @@ mod rsa {
     }
 }
 
-fn gamming_cipher(message: &str, key: &str) -> String {
-    message
-        .chars()
-        .zip(key.chars().cycle())
-        .map(|(m, k)| (m as u8 ^ k as u8) as char)
-        .collect()
+fn gamming_cipher(message: &[u8], key: &[u8]) -> Vec<u8> {
+    message.iter().zip(key.iter().cycle()).map(|(m, k)| m ^ k).collect()
 }
-
+//
+// #[derive(Default)]
 // struct VoterData {
 //     name: String,
 //     rsa: RSA
@@ -184,18 +199,30 @@ fn gamming_cipher(message: &str, key: &str) -> String {
 //     Voted(VoterData),
 // }
 //
-// #[derive(Error, Debug)]
+// #[derive(Debug)]
 // enum VoteError {
 //     CanNotVote,
 //     AlreadyVoted,
 // }
 //
 // impl VoterState {
-//     fn vote(self) -> (VoterState, Result<(), VoteError>) {
+//     fn vote(&mut self, candidate: &str) -> Result<(), VoteError> {
 //         match self {
-//             VoterState::CanVote(voter) => (VoterState::Voted(voter), Ok(())),
-//             voter @ VoterState::CanNotVote(_) => (voter, Err(VoteError::CanNotVote)),
-//             voter @ VoterState::CanNotVote(_) => (voter, Err(VoteError::AlreadyVoted)),
+//             VoterState::CanVote(voter) => {
+//                 let mut rng = rand::thread_rng();
+//
+//                 let key: Vec<u8> = (0..16).map(|_| rng.gen_range(0..u8::MAX)).collect();
+//                 let encrypted_vote = gamming_cipher(candidate.as_bytes(), &key);
+//
+//
+//                 let signature = voter.rsa.encrypt(voter.rsa.quad_fold_hash(&encrypted_vote));
+//
+//
+//                 *self = VoterState::Voted(std::mem::take(voter));
+//                 Ok(())
+//             },
+//             VoterState::CanNotVote(_) => Err(VoteError::CanNotVote),
+//             VoterState::Voted(_) => Err(VoteError::AlreadyVoted),
 //         }
 //     }
 // }
@@ -289,7 +316,10 @@ fn gamming_cipher(message: &str, key: &str) -> String {
 //     }
 // }
 
+struct A{}
+
 fn main() {
+    let mut v = vec![A{}];
     // let candidates = vec!["Кандидат A".to_string(), "Кандидат B".to_string(), "Кандидат C".to_string()];
     // let voters = vec![
     //     Voter::new("Виборець 1", true),

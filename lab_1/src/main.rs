@@ -165,26 +165,6 @@ mod voter {
     use num_bigint::BigUint;
     use crate::{gamming_cipher, rsa};
 
-    #[derive(Default)]
-    pub struct VoterData { key_pair: rsa::KeyPair }
-    impl VoterData {
-        pub fn new() -> Self {
-            Self { key_pair: rsa::KeyPair::new() }
-        }
-    }
-
-    pub enum VoterState {
-        CanVote(VoterData),
-        CanNotVote(VoterData),
-        Voted(VoterData),
-    }
-
-    #[derive(Debug)]
-    pub enum VoteError {
-        CanNotVote,
-        AlreadyVoted,
-    }
-
     #[derive(Getters)]
     #[getset(get = "pub with_prefix")]
     pub struct VoteData {
@@ -193,45 +173,40 @@ mod voter {
         gammed_vote: Vec<u8>
     }
 
-    impl VoterState {
-        pub fn vote(&mut self, candidate: &str, cec_public_key: rsa::PublicKey) -> Result<VoteData, VoteError> {
-            match self {
-                VoterState::CanVote(voter) => {
-                    let gamming_key = rsa::generate_num();
+    #[derive(Default)]
+    pub struct Voter { key_pair: rsa::KeyPair }
+    impl Voter {
+        pub fn new() -> Self {
+            Self { key_pair: rsa::KeyPair::new() }
+        }
 
-                    let gammed_vote = gamming_cipher(candidate.as_bytes(), &gamming_key.to_bytes_le());
-                    let gammed_vote_hash = voter.key_pair.quad_fold_hash(&gammed_vote);
+        pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
+            let gamming_key = rsa::generate_num();
 
-                    let rsa_signature = voter.key_pair.get_private_key().apply(&gammed_vote_hash).unwrap();
-                    let encrypted_gamming_key = cec_public_key.apply(&gamming_key).unwrap();
+            let gammed_vote = gamming_cipher(candidate.as_bytes(), &gamming_key.to_bytes_le());
+            let gammed_vote_hash = self.key_pair.quad_fold_hash(&gammed_vote);
 
-                    *self = VoterState::Voted(std::mem::take(voter));
-                    Ok(VoteData { encrypted_gamming_key, rsa_signature, gammed_vote })
-                },
-                VoterState::CanNotVote(_) => Err(VoteError::CanNotVote),
-                VoterState::Voted(_) => Err(VoteError::AlreadyVoted),
-            }
+            let rsa_signature = self.key_pair.get_private_key().apply(&gammed_vote_hash).unwrap();
+            let encrypted_gamming_key = cec_public_key.apply(&gamming_key).unwrap();
+
+            VoteData { encrypted_gamming_key, rsa_signature, gammed_vote }
         }
 
         pub fn get_public_key(&self) -> rsa::PublicKey {
-            match self {
-                VoterState::CanVote(voter) => voter.key_pair.get_public_key(),
-                VoterState::CanNotVote(voter) => voter.key_pair.get_public_key(),
-                VoterState::Voted(voter) => voter.key_pair.get_public_key(),
-            }
+            self.key_pair.get_public_key()
         }
     }
 }
 
 mod cec {
     use std::collections::HashMap;
-    use rand::seq::IteratorRandom;
     use thiserror::Error;
     use crate::rsa;
     use crate::{gamming_cipher, voter};
+    use crate::rsa::PublicKey;
 
     pub struct CEC {
-        candidates: HashMap<&'static str, u64>,
+        candidates: HashMap<String, u64>,
         voters_state: HashMap<rsa::PublicKey, VoterState>,
         key_pair: rsa::KeyPair,
     }
@@ -245,7 +220,7 @@ mod cec {
         #[error("Failed parse candidate")]
         FailedParseCandidate,
         #[error("Invalid candidate")]
-        InvalidCandidate,
+        CandidateNotRegistered,
         #[error("Voter has already voted")]
         VoterAlreadyVoted,
         #[error("Voter can not vote")]
@@ -262,15 +237,15 @@ mod cec {
 
     impl CEC {
         pub fn new<I>(candidates: I, voters_state: HashMap<rsa::PublicKey, VoterState>) -> Self
-            where I: Iterator<Item=&str> {
+            where I: Iterator<Item=String> {
             Self {
-                candidates: HashMap::from(candidates.map(|c| (c, 0u64))),
+                candidates: HashMap::from_iter(candidates.map(|c| (c, 0u64))),
                 voters_state,
                 key_pair: rsa::KeyPair::new()
             }
         }
 
-        fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)
+        pub fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)
             -> Result<(), VoteError> {
             if let Some(state) = self.voters_state.get(voter_key) {
                 match state {
@@ -285,14 +260,14 @@ mod cec {
                                 if let Ok(candidate) = String::from_utf8(
                                     gamming_cipher(vote_data.get_gammed_vote(), &gamming_key.to_bytes_le())
                                 ) {
-                                    if let Some(score) = self.candidates.get_mut(&candidate) {
+                                    if let Some(score) = self.candidates.get_mut(candidate.as_str()) {
                                         *score += 1;
                                         Ok(())
                                     } else {
-                                        Err(VoteError::InvalidCandidate)
+                                        Err(VoteError::CandidateNotRegistered)
                                     }
                                 } else {
-                                    Err(VoteError::InvalidCandidate)
+                                    Err(VoteError::FailedParseCandidate)
                                 }
                             } else {
                                 Err(VoteError::FailedParseGammingKey)
@@ -307,22 +282,12 @@ mod cec {
             }
         }
 
-        fn do_organize_vote(
-            voters: &mut [voter::VoterState],
-            candidates: &mut HashMap<String, u64>,
-            key_pair: &rsa::KeyPair
-        ) -> Result<(), VoteError> {
-            for voter in voters {
+        pub fn get_candidates(&self) -> impl Iterator<Item=&String> {
+            self.candidates.keys()
+        }
 
-                let vote_data = voter.vote(
-                    candidates.keys().choose(&mut rand::thread_rng()).unwrap(),
-                    key_pair.get_public_key()
-                ).unwrap();
-
-
-
-            }
-            Ok(())
+        pub fn get_public_key(&self) -> PublicKey {
+            self.key_pair.get_public_key()
         }
     }
 }
@@ -330,9 +295,8 @@ mod cec {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use crate::cec::CEC;
-    use crate::voter::{VoterData};
-    use super::{gamming_cipher, voter};
+    use rand::seq::IteratorRandom;
+    use super::{gamming_cipher, cec, voter};
 
     #[test]
     fn test_gamming_cypher() {
@@ -347,15 +311,26 @@ mod tests {
 
     #[test]
     fn test_vote() {
-        let voters = (0..100).into_iter()
-            .map(|_| voter::VoterState::CanVote(VoterData::new())).collect::<Vec<_>>();
-        let vote_cand = HashMap::<String, u64>::from_iter(
-            (0..5).into_iter().map(|i| (format!("Candidate {}", i), 0u64))
-        );
-        let mut cec = CEC::new(voters, vote_cand);
-        cec.organize_vote().unwrap();
+        let mut voters = (0..100).into_iter().map(|_| voter::Voter::new())
+            .collect::<Vec<_>>();
 
-        cec.
+        let mut cec = cec::CEC::new(
+            (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+            HashMap::from_iter(voters.iter().map(|v| (v.get_public_key(), cec::VoterState::CanVote)))
+        );
+
+        let mut rng = rand::thread_rng();
+
+        for voter in &mut voters {
+            let vote_data = voter.vote(
+                cec.get_candidates().choose(&mut rng).unwrap(),
+                &cec.get_public_key()
+            );
+
+            if let Err(err) = cec.process_vote(&voter.get_public_key(), vote_data) {
+                println!("{}", err);
+            }
+        }
     }
 }
 

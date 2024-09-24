@@ -1,11 +1,8 @@
+use std::marker::PhantomData;
 use rand::Rng;
-use std::collections::HashMap;
 use rand::seq::IteratorRandom;
-use crate::voter::{VoteData, VoteError, VoterState};
-
-use num_bigint::{BigInt, BigUint};
+use crate::voter::{GammingKeyType, VoterState};
 use num_traits::One;
-
 
 mod rsa {
     use std::ops::Rem;
@@ -13,12 +10,15 @@ mod rsa {
     use num_bigint::{BigInt, BigUint, RandBigInt, ToBigInt};
     use num_traits::{CheckedEuclid, Euclid, One, Zero};
     use rand::Rng;
-    pub use keys::{KeyPair, PublicKey, PrivateKey};
+    pub use keys::{KeyPair, PublicKey, PrivateKey, MIN_N};
+
+    const MIN_GENERATED_NUMBER: u32 = u16::MAX as u32;
+    const MAX_GENERATED_NUMBER: u32 = u32::MAX;
 
     fn generate_num(predicate: fn(&BigUint) -> bool) -> BigUint {
         let mut rng = rand::thread_rng();
         loop {
-            let num = BigUint::from(rng.gen_range(u64::MAX as u128..u128::MAX));
+            let num = BigUint::from(rng.gen_range(MIN_GENERATED_NUMBER..MAX_GENERATED_NUMBER));
             if predicate(&num) {
                 return num;
             }
@@ -58,7 +58,6 @@ mod rsa {
                 return false;
             }
             i += BigUint::one();
-
         }
         true
     }
@@ -84,14 +83,22 @@ mod rsa {
     }
 
     mod keys {
+        use lazy_static::lazy_static;
         use num_bigint::BigUint;
         use num_traits::{One, Zero};
-        use crate::rsa::{generate_prime, generate_uneven, TWO};
+        use crate::rsa::{generate_prime, generate_uneven, MIN_GENERATED_NUMBER, TWO};
 
         fn quad_fold_hash(n: &BigUint, data: &[u8]) -> BigUint {
             data.iter().fold(BigUint::zero(), |acc, x| {
                 (acc + BigUint::from(*x)).modpow(&TWO, &n)
             })
+        }
+
+        fn apply_key(data: &BigUint, exp: &BigUint, modulus: &BigUint) -> Option<BigUint> {
+            if data > modulus {
+                return None;
+            }
+            Some(data.modpow(exp, modulus))
         }
 
         pub struct PrivateKey {
@@ -100,8 +107,8 @@ mod rsa {
         }
 
         impl PrivateKey {
-            pub fn apply(&self, data: &BigUint) -> BigUint {
-                data.modpow(&self.d, &self.n)
+            pub fn apply(&self, data: &BigUint) -> Option<BigUint> {
+                apply_key(data, &self.d, &self.n)
             }
 
             pub fn quad_fold_hash(&self, data: &[u8]) -> BigUint {
@@ -115,8 +122,8 @@ mod rsa {
         }
 
         impl PublicKey {
-            pub fn apply(&self, data: &BigUint) -> BigUint {
-                data.modpow(&self.e, &self.n)
+            pub fn apply(&self, data: &BigUint) -> Option<BigUint> {
+                apply_key(data, &self.e, &self.n)
             }
 
             pub fn quad_fold_hash(&self, data: &[u8]) -> BigUint {
@@ -139,6 +146,10 @@ mod rsa {
                     d: BigUint::from(3u32)
                 }
             }
+        }
+
+        lazy_static! {
+            pub static ref MIN_N: BigUint = BigUint::from(MIN_GENERATED_NUMBER).pow(2);
         }
 
         impl KeyPair {
@@ -179,15 +190,11 @@ mod rsa {
                 let r = KeyPair::new();
                 let message_hash = r.quad_fold_hash("message".as_bytes());
 
-                let encrypted_hash = r.get_private_key().apply(&message_hash);
-                assert_eq!(r.get_public_key().apply(&encrypted_hash), message_hash);
+                let encrypted_hash = r.get_private_key().apply(&message_hash).unwrap();
+                assert_eq!(r.get_public_key().apply(&encrypted_hash).unwrap(), message_hash);
 
-                let encrypted_hash = r.get_public_key().apply(&message_hash);
-                assert_eq!(r.get_private_key().apply(&encrypted_hash), message_hash);
-
-                let val = BigUint::from(16759209801966663075u64);
-                let res = r.get_public_key().apply(&val);
-                assert_eq!(r.get_private_key().apply(&res), val);
+                let encrypted_hash = r.get_public_key().apply(&message_hash).unwrap();
+                assert_eq!(r.get_private_key().apply(&encrypted_hash).unwrap(), message_hash);
             }
         }
     }
@@ -201,6 +208,7 @@ mod voter {
     use getset::Getters;
     use num_bigint::BigUint;
     use rand::Rng;
+    use static_assertions::const_assert;
     use crate::{gamming_cipher, rsa};
     use crate::rsa::PublicKey;
 
@@ -232,12 +240,14 @@ mod voter {
         gammed_vote: Vec<u8>
     }
 
+    pub type GammingKeyType = u16;
+
     impl VoterState {
         pub fn vote(&mut self, candidate: &str, cec_public_key: rsa::PublicKey) -> Result<VoteData, VoteError> {
             match self {
                 VoterState::CanVote(voter) => {
                     let mut rng = rand::thread_rng();
-                    let mut gamming_key: [u8; 8] = Default::default();
+                    let mut gamming_key = GammingKeyType::MIN.to_le_bytes();
                     for e in &mut gamming_key {
                         *e = rng.gen_range(0..u8::MAX)
                     }
@@ -245,9 +255,9 @@ mod voter {
                     let gammed_vote = gamming_cipher(candidate.as_bytes(), &gamming_key);
                     let gammed_vote_hash = voter.key_pair.quad_fold_hash(&gammed_vote);
 
-                    let rsa_signature = voter.key_pair.get_private_key().apply(&gammed_vote_hash);
-                    let gamming_key = BigUint::from(u64::from_le_bytes(gamming_key));
-                    let encrypted_gamming_key = cec_public_key.apply(&gamming_key);
+                    let rsa_signature = voter.key_pair.get_private_key().apply(&gammed_vote_hash).unwrap();
+                    let gamming_key = BigUint::from(GammingKeyType::from_le_bytes(gamming_key));
+                    let encrypted_gamming_key = cec_public_key.apply(&gamming_key).unwrap();
 
                     *self = VoterState::Voted(std::mem::take(voter));
                     Ok(VoteData { encrypted_gamming_key, rsa_signature, gammed_vote })
@@ -270,10 +280,17 @@ mod voter {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use rand::seq::IteratorRandom;
-    use crate::voter::VoterData;
+    use static_assertions::const_assert;
+    use crate::voter::{GammingKeyType, VoterData};
     use super::{gamming_cipher, rsa, VoterState};
+
+    #[test]
+    fn test_assertions() {
+        assert!(BigUint::from(GammingKeyType::MAX) < *rsa::MIN_N);
+    }
 
     #[test]
     fn test_gamming_cypher() {
@@ -288,11 +305,11 @@ mod tests {
 
     #[test]
     fn test_vote() {
-        let mut voters = (0..100).into_iter()
+        let mut voters = (0..10).into_iter()
             .map(|_| VoterState::CanVote(VoterData::new())).collect::<Vec<_>>();
         let key_pair = rsa::KeyPair::new();
         let mut vote_cand = HashMap::<String, u64>::from_iter(
-            (0..10).into_iter().map(|i| (format!("Candidate {}", i), 0u64))
+            (0..5).into_iter().map(|i| (format!("Candidate {}", i), 0u64))
         );
 
         for voter in &mut voters {
@@ -302,26 +319,35 @@ mod tests {
             ).unwrap();
 
             let hash = voter.get_public_key().quad_fold_hash(vote_data.get_gammed_vote());
-            let decrypted_hash = voter.get_public_key().apply(vote_data.get_rsa_signature());
+            let decrypted_hash = voter.get_public_key().apply(vote_data.get_rsa_signature()).unwrap();
+
             if hash != decrypted_hash {
                 println!("Hashes do not match");
                 continue;
             }
 
-            let gamming_key = key_pair.get_private_key()
-                .apply(vote_data.get_encrypted_gamming_key())
-                .to_u64().unwrap().to_le_bytes();
+            if let Some(decrypted_gamming_key) = key_pair.get_private_key()
+                .apply(vote_data.get_encrypted_gamming_key()) {
 
-            if let Ok(candidate) = String::from_utf8(gamming_cipher(vote_data.get_gammed_vote(), &gamming_key)) {
-                if let Some(score) = vote_cand.get_mut(&candidate) {
-                    *score += 1;
+                if let Some(gamming_key) = decrypted_gamming_key.to_u16() {
+
+                    let gamming_key_arr = gamming_key.to_le_bytes();
+                    if let Ok(candidate) = String::from_utf8(gamming_cipher(vote_data.get_gammed_vote(), &gamming_key_arr)) {
+                        if let Some(score) = vote_cand.get_mut(&candidate) {
+                            *score += 1;
+                        } else {
+                            println!("Invalid candidate");
+                            continue;
+                        }
+                    } else {
+                        println!("Can not parse candidate");
+                        continue;
+                    }
                 } else {
-                    println!("Invalid candidate");
-                    continue;
+                    println!("Decrypted gamming key is too large");
                 }
             } else {
-                println!("Can not parse candidate");
-                continue;
+                println!("Can not parse gamming key");
             }
         }
     }

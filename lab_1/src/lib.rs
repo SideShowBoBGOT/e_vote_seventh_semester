@@ -165,7 +165,7 @@ mod voter {
     use num_bigint::BigUint;
     use crate::{gamming_cipher, rsa};
 
-    #[derive(Getters)]
+    #[derive(Getters, Clone)]
     #[getset(get = "pub with_prefix")]
     pub struct VoteData {
         encrypted_gamming_key: BigUint,
@@ -211,7 +211,7 @@ mod cec {
         key_pair: rsa::KeyPair,
     }
 
-    #[derive(Error, Debug)]
+    #[derive(Error, Debug, PartialEq, Eq)]
     pub enum VoteError {
         #[error("Gamming keys do not match")]
         GammingKeyHashedNotMatch,
@@ -229,6 +229,7 @@ mod cec {
         VoterNotRegistered
     }
 
+    #[derive(Debug)]
     pub enum VoterState {
         CanVote,
         CanNotVote,
@@ -247,13 +248,14 @@ mod cec {
 
         pub fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)
             -> Result<(), VoteError> {
-            if let Some(state) = self.voters_state.get(voter_key) {
+            if let Some(state) = self.voters_state.get_mut(voter_key) {
                 match state {
                     VoterState::Voted => Err(VoteError::VoterAlreadyVoted),
                     VoterState::CanNotVote => Err(VoteError::VoterCanNotVote),
                     VoterState::CanVote => {
                         let hash = voter_key.quad_fold_hash(vote_data.get_gammed_vote());
                         let decrypted_hash = voter_key.apply(vote_data.get_rsa_signature()).unwrap();
+
                         if hash == decrypted_hash {
                             if let Some(gamming_key) = self.key_pair.get_private_key()
                                 .apply(vote_data.get_encrypted_gamming_key()) {
@@ -261,6 +263,7 @@ mod cec {
                                     gamming_cipher(vote_data.get_gammed_vote(), &gamming_key.to_bytes_le())
                                 ) {
                                     if let Some(score) = self.candidates.get_mut(candidate.as_str()) {
+                                        *state = VoterState::Voted;
                                         *score += 1;
                                         Ok(())
                                     } else {
@@ -282,8 +285,8 @@ mod cec {
             }
         }
 
-        pub fn get_candidates(&self) -> impl Iterator<Item=&String> {
-            self.candidates.keys()
+        pub fn get_candidates(&self) -> &HashMap<String, u64> {
+            &self.candidates
         }
 
         pub fn get_public_key(&self) -> PublicKey {
@@ -323,7 +326,7 @@ mod tests {
 
         for voter in &mut voters {
             let vote_data = voter.vote(
-                cec.get_candidates().choose(&mut rng).unwrap(),
+                cec.get_candidates().keys().choose(&mut rng).unwrap(),
                 &cec.get_public_key()
             );
 
@@ -331,54 +334,51 @@ mod tests {
                 println!("{}", err);
             }
         }
+
+        for el in cec.get_candidates() {
+            println!("{:?}", el);
+        }
     }
-}
 
+    #[test]
+    fn test_can_not_vote() {
+        let mut voter = voter::Voter::new();
 
+        let mut cec = cec::CEC::new(
+            (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+            HashMap::from([
+                (voter.get_public_key(), cec::VoterState::CanNotVote)
+            ])
+        );
 
-    // fn count_votes(&self) -> HashMap<String, usize> {
-    //     let mut results = HashMap::new();
-    //     for candidate in &self.candidates {
-    //         results.insert(candidate.clone(), self.votes.iter().filter(|&v| v == candidate).count());
-    //     }
-    //     results
-    // }
+        let vote_data = voter.vote(
+            cec.get_candidates().keys().last().unwrap(),
+            &cec.get_public_key()
+        );
 
-fn main() {
-    // let candidates = vec!["Кандидат A".to_string(), "Кандидат B".to_string(), "Кандидат C".to_string()];
-    // let voters = vec![
-    //     Voter::new("Виборець 1", true),
-    //     Voter::new("Виборець 2", true),
-    //     Voter::new("Виборець 3", true),
-    //     Voter::new("Виборець 4", true),
-    //     Voter::new("Виборець 5", false),
-    // ];
-    //
-    // let mut cec = CEC::new(candidates.clone(), voters);
-    //
-    // let mut rng = rand::thread_rng();
-    // for voter_name in ["Виборець 1", "Виборець 2", "Виборець 3", "Виборець 4", "Виборець 5"] {
-    //     if let Some(voter) = cec.voters.get_mut(voter_name) {
-    //         let candidate = candidates[rng.gen_range(0..candidates.len())].clone();
-    //         if let Some(vote_data) = voter.vote(&candidate, (cec.rsa.e, cec.rsa.n)) {
-    //             let result = cec.receive_vote(voter_name, vote_data);
-    //             println!("{}: {}", voter_name, result);
-    //         }
-    //     }
-    // }
-    //
-    // // Спроба повторного голосування
-    // if let Some(voter) = cec.voters.get_mut("Виборець 1") {
-    //     let candidate = candidates[rng.gen_range(0..candidates.len())].clone();
-    //     if let Some(_) = voter.vote(&candidate, (cec.rsa.e, cec.rsa.n)) {
-    //         println!("Спроба повторного голосування Виборець 1: Виборець вже проголосував");
-    //     }
-    // }
-    //
-    // // Підрахунок голосів
-    // let results = cec.count_votes();
-    // println!("\nРезультати голосування:");
-    // for (candidate, votes) in results {
-    //     println!("{}: {} голосів", candidate, votes);
-    // }
+        let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
+        assert_eq!(err, cec::VoteError::VoterCanNotVote);
+    }
+
+    #[test]
+    fn test_already_voted() {
+        let mut voter = voter::Voter::new();
+
+        let mut cec = cec::CEC::new(
+            (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+            HashMap::from([
+                (voter.get_public_key(), cec::VoterState::CanVote)
+            ])
+        );
+
+        let vote_data = voter.vote(
+            cec.get_candidates().keys().last().unwrap(),
+            &cec.get_public_key()
+        );
+
+        cec.process_vote(&voter.get_public_key(), vote_data.clone()).unwrap();
+
+        let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
+        assert_eq!(err, cec::VoteError::VoterAlreadyVoted);
+    }
 }

@@ -1,10 +1,12 @@
+extern crate derive_more;
+
 mod rsa {
     use std::ops::Rem;
     use lazy_static::lazy_static;
     use num_bigint::{BigUint};
     use num_traits::{One, Zero};
     use rand::Rng;
-    pub use keys::{KeyPair};
+    pub use keys::{KeyPair, PUBLIC_NUMBER, PublicKeyRef};
 
     const MIN_GENERATED_NUMBER: u32 = u16::MAX as u32;
     const MAX_GENERATED_NUMBER: u32 = u32::MAX;
@@ -47,6 +49,7 @@ mod rsa {
 
     mod keys {
         use std::borrow::Borrow;
+        use derive_more::Deref;
         use getset::Getters;
         use lazy_static::lazy_static;
         use num_bigint::BigUint;
@@ -57,7 +60,7 @@ mod rsa {
             pub static ref PUBLIC_NUMBER: BigUint = BigUint::from(65537u32);
         }
 
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Deref)]
         pub struct ProductNumber(BigUint);
 
         // #[derive(Debug, Clone, Getters)]
@@ -177,49 +180,117 @@ mod rsa {
         }
     }
 }
-//
-// fn gamming_cipher(message: &[u8], key: &[u8]) -> Vec<u8> {
-//     message.iter().zip(key.iter().cycle()).map(|(m, k)| m ^ k).collect()
-// }
-//
-// mod voter {
-//     use getset::Getters;
-//     use num_bigint::BigUint;
-//     use crate::{gamming_cipher, rsa};
-//
-//     #[derive(Getters, Clone)]
-//     #[getset(get = "pub with_prefix")]
-//     pub struct VoteData {
-//         encrypted_gamming_key: BigUint,
-//         rsa_signature: BigUint,
-//         gammed_vote: Vec<u8>
-//     }
-//
-//     #[derive(Default)]
-//     pub struct Voter { key_pair: rsa::KeyPair }
-//     impl Voter {
-//         pub fn new() -> Self {
-//             Self { key_pair: rsa::KeyPair::new() }
-//         }
-//
-//         pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
-//             let gamming_key = rsa::generate_num();
-//
-//             let gammed_vote = gamming_cipher(candidate.as_bytes(), &gamming_key.to_bytes_le());
-//             let gammed_vote_hash = self.key_pair.quad_fold_hash(&gammed_vote);
-//
-//             let rsa_signature = self.key_pair.get_private_key().apply(&gammed_vote_hash).unwrap();
-//             let encrypted_gamming_key = cec_public_key.apply(&gamming_key).unwrap();
-//
-//             VoteData { encrypted_gamming_key, rsa_signature, gammed_vote }
-//         }
-//
-//         pub fn get_public_key(&self) -> rsa::PublicKey {
-//             self.key_pair.get_public_key()
-//         }
-//     }
-// }
-//
+
+mod voter {
+    use getset::Getters;
+    use num_bigint::BigUint;
+    use num_traits::One;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use crate::rsa;
+    use crate::rsa::PublicKeyRef;
+
+    #[derive(Getters, Clone)]
+    #[getset(get = "pub with_prefix")]
+    pub struct VoteData {
+        encrypted_gamming_key: BigUint,
+        rsa_signature: BigUint,
+        gammed_vote: Vec<u8>
+    }
+
+    #[derive(Default)]
+    pub struct Voter {
+        key_pair: rsa::KeyPair,
+        id: BigUint
+    }
+
+    impl Voter {
+        pub fn new() -> Self {
+            Self {
+                key_pair: rsa::KeyPair::new(),
+                id: rsa::generate_num()
+            }
+        }
+
+        pub fn produce_packets(
+            &self,
+            packets_numer: std::num::NonZeroUsize,
+            candidates: impl Iterator<Item=&str>,
+            cec_public_key: &PublicKeyRef
+        ) {
+            let vec_serialized_candidate_with_id_pairs = {
+                (0..packets_numer.get())
+                    .into_iter()
+                    .map(|_| {
+                        let candidate_id_pairs = {
+                            candidates.map(|c| (c, &self.id)).collect::<Vec<_>>()
+                        };
+                        bincode::serialize(&candidate_id_pairs)
+                            .expect("Failed to serialize candidate_id_pairs")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mask_key = BigUint::one()
+                .modinv(&self.key_pair.get_product_number())
+                .expect("Generation of random multiplicative failed");
+            let vec_masked_candidate_with_id_pairs = {
+                let chunk_size = {
+                    let bits = self.key_pair.get_product_number().bits() as usize;
+                    assert!(bits >= 2);
+                    bits - 1
+                };
+                let mask_multiplicative = {
+                    mask_key.modpow(&rsa::PUBLIC_NUMBER, cec_public_key.get_product_number())
+                };
+                vec_serialized_candidate_with_id_pairs.into_iter()
+                    .map(|serialized_candidate_id_pair| {
+                        serialized_candidate_id_pair.windows(chunk_size)
+                            .map(|data_chunk| {
+                                BigUint::from_bytes_le(data_chunk) * mask_multiplicative
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+
+            let masked_serialized = bincode::serialize(&masked)
+                .expect("Failed to serialize masked packet");
+
+
+        }
+        //
+        // pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
+        //     let gamming_key = rsa::generate_num();
+        //
+        //     let gammed_vote = gamming_cipher(candidate.as_bytes(), &gamming_key.to_bytes_le());
+        //     let gammed_vote_hash = self.key_pair.quad_fold_hash(&gammed_vote);
+        //
+        //     let rsa_signature = self.key_pair.get_private_key().apply(&gammed_vote_hash).unwrap();
+        //     let encrypted_gamming_key = cec_public_key.apply(&gamming_key).unwrap();
+        //
+        //     VoteData { encrypted_gamming_key, rsa_signature, gammed_vote }
+        // }
+        //
+        // pub fn get_public_key(&self) -> rsa::PublicKey {
+        //     self.key_pair.get_public_key()
+        // }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_serialization() {
+        let n = "message";
+
+        let k = bincode::serialize(n).unwrap();
+
+        let a: String = bincode::deserialize(&k).unwrap();
+
+        println!("{}", a);
+    }
+}
+
 // mod cec {
 //     use std::collections::HashMap;
 //     use thiserror::Error;
@@ -317,8 +388,8 @@ mod rsa {
 //     }
 // }
 
-#[cfg(test)]
-mod tests {
+// #[cfg(test)]
+// mod tests {
     // use std::collections::HashMap;
     // use rand::seq::IteratorRandom;
     // use super::{gamming_cipher, cec, voter};
@@ -403,4 +474,4 @@ mod tests {
     //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
     //     assert_eq!(err, cec::VoteError::VoterAlreadyVoted);
     // }
-}
+// }

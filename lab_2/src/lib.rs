@@ -2,11 +2,12 @@ extern crate derive_more;
 
 mod rsa {
     use std::ops::Rem;
+    use derive_more::Deref;
+    use getset::Getters;
     use lazy_static::lazy_static;
     use num_bigint::{BigUint};
-    use num_traits::{One, Zero};
+    use num_traits::{One, ToBytes, Zero};
     use rand::Rng;
-    pub use keys::{KeyPair, PUBLIC_NUMBER, PublicKeyRef};
 
     const MIN_GENERATED_NUMBER: u32 = u16::MAX as u32;
     const MAX_GENERATED_NUMBER: u32 = u32::MAX;
@@ -47,137 +48,193 @@ mod rsa {
         generate_num_by_condition(is_prime)
     }
 
-    mod keys {
-        use std::borrow::Borrow;
-        use derive_more::Deref;
-        use getset::Getters;
-        use lazy_static::lazy_static;
-        use num_bigint::BigUint;
-        use num_traits::{One, Zero};
-        use crate::rsa::{generate_prime, TWO};
-
-        lazy_static! {
+    lazy_static! {
             pub static ref PUBLIC_NUMBER: BigUint = BigUint::from(65537u32);
         }
 
-        #[derive(Debug, Clone, Deref)]
-        pub struct ProductNumber(BigUint);
+    #[derive(Debug, Clone, Deref)]
+    pub struct ProductNumber(BigUint);
 
-        // #[derive(Debug, Clone, Getters)]
-        // pub struct PrivateKey {
-        //     private_number: BigUint,
-        //     #[get = "pub with_prefix"]
-        //     product_number: ProductNumber
-        // }
+    // #[derive(Debug, Clone, Getters)]
+    // pub struct PrivateKey {
+    //     private_number: BigUint,
+    //     #[get = "pub with_prefix"]
+    //     product_number: ProductNumber
+    // }
 
-        #[derive(Debug, Getters)]
-        pub struct PrivateKeyRef<'a> {
-            private_number: &'a BigUint,
-            #[get = "pub with_prefix"]
-            product_number: &'a ProductNumber
+    #[derive(Debug, Getters)]
+    pub struct PrivateKeyRef<'a> {
+        private_number: &'a BigUint,
+        #[get = "pub with_prefix"]
+        product_number: &'a ProductNumber
+    }
+
+    // #[derive(Debug, Clone, Getters)]
+    // pub struct PublicKey {
+    //     #[get = "pub with_prefix"]
+    //     product_number: ProductNumber
+    // }
+
+    #[derive(Debug, Getters)]
+    pub struct PublicKeyRef<'a> {
+        #[get = "pub with_prefix"]
+        product_number: &'a ProductNumber
+    }
+
+    #[derive(Debug, Clone, Getters)]
+    pub struct KeyPair {
+        #[get = "pub with_prefix"]
+        product_number: ProductNumber,
+        private_number: BigUint,
+    }
+
+    impl Default for KeyPair {
+        fn default() -> Self {
+            DEFAULT_KEY_PAIR.clone()
         }
+    }
 
-        // #[derive(Debug, Clone, Getters)]
-        // pub struct PublicKey {
-        //     #[get = "pub with_prefix"]
-        //     product_number: ProductNumber
-        // }
-
-        #[derive(Debug, Getters)]
-        pub struct PublicKeyRef<'a> {
-            #[get = "pub with_prefix"]
-            product_number: &'a ProductNumber
-        }
-
-        #[derive(Debug, Clone, Getters)]
-        pub struct KeyPair {
-            #[get = "pub with_prefix"]
-            product_number: ProductNumber,
-            private_number: BigUint,
-        }
-
-        impl Default for KeyPair {
-            fn default() -> Self {
-                DEFAULT_KEY_PAIR.clone()
-            }
-        }
-
-        lazy_static! {
+    lazy_static! {
             pub static ref DEFAULT_KEY_PAIR: KeyPair = KeyPair::new();
         }
 
-        impl KeyPair {
-            pub fn new() -> Self {
-                loop {
-                    let p = generate_prime();
-                    let q = generate_prime();
-                    let n = ProductNumber(p.clone() * q.clone());
-                    let phi = (p.clone() - BigUint::one()) * (q.clone() - BigUint::one());
-                    if *PUBLIC_NUMBER < phi {
-                        if let Some(d) = PUBLIC_NUMBER.modinv(&phi) {
-                            return Self { product_number: n, private_number: d }
-                        }
+    impl KeyPair {
+        pub fn new() -> Self {
+            loop {
+                let p = generate_prime();
+                let q = generate_prime();
+                let n = ProductNumber(p.clone() * q.clone());
+                let phi = (p.clone() - BigUint::one()) * (q.clone() - BigUint::one());
+                if *PUBLIC_NUMBER < phi {
+                    if let Some(d) = PUBLIC_NUMBER.modinv(&phi) {
+                        return Self { product_number: n, private_number: d }
                     }
                 }
             }
-
-            pub fn get_private_key_ref(&self) -> PrivateKeyRef {
-                PrivateKeyRef { product_number: &self.product_number, private_number: &self.private_number }
-            }
-
-            pub fn get_public_key_ref(&self) -> PublicKeyRef {
-                PublicKeyRef { product_number: &self.product_number }
-            }
         }
 
-        fn quad_fold_hash(n: &ProductNumber, data: &[u8]) -> BigUint {
-            data.iter().fold(BigUint::zero(), |acc, x| {
-                (acc + BigUint::from(*x)).modpow(&TWO, &n.0)
-            })
+        pub fn get_private_key_ref(&self) -> PrivateKeyRef {
+            PrivateKeyRef { product_number: &self.product_number, private_number: &self.private_number }
         }
 
-        pub trait KeyRef {
-            fn get_parts(&self) -> (&BigUint, &ProductNumber);
+        pub fn get_public_key_ref(&self) -> PublicKeyRef {
+            PublicKeyRef { product_number: &self.product_number }
+        }
+    }
+
+    fn quad_fold_hash(n: &ProductNumber, data: &[u8]) -> BigUint {
+        data.iter().fold(BigUint::zero(), |acc, x| {
+            (acc + BigUint::from(*x)).modpow(&TWO, &n.0)
+        })
+    }
+
+    pub trait KeyRef {
+        fn get_parts(&self) -> (&BigUint, &ProductNumber);
+    }
+
+    impl KeyRef for PrivateKeyRef<'_> {
+        fn get_parts(&self) -> (&BigUint, &ProductNumber) {
+            (self.private_number, self.product_number)
+        }
+    }
+
+    impl KeyRef for PublicKeyRef<'_> {
+        fn get_parts(&self) -> (&BigUint, &ProductNumber) {
+            (&PUBLIC_NUMBER, self.product_number)
+        }
+    }
+
+    fn calc_chunk_size(product_number: &ProductNumber) -> usize {
+        let bits = product_number.bits() as usize;
+        assert!(bits >= 2);
+        bits - 1
+    }
+
+    pub struct CipheredData(Vec<BigUint>);
+    pub struct DecipheredData(Vec<u8>);
+
+    pub fn cipher_data(key: &impl KeyRef, data: &[u8]) -> CipheredData {
+        let (part, product_number) = key.get_parts();
+        let chunk_size = calc_chunk_size(product_number);
+        CipheredData(
+            data.chunks(chunk_size)
+                .map(|data_chunk| {
+                    BigUint::from_bytes_le(data_chunk).modpow(part, product_number)
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+
+    pub fn decipher_data(key: &impl KeyRef, ciphered_data: &CipheredData) -> DecipheredData {
+        let (part, product_number) = key.get_parts();
+        ciphered_data.0.iter().fold(DecipheredData(Vec::new()), |mut acc, chunk| {
+            acc.0.extend(
+                chunk.modpow(part, product_number).to_bytes_le()
+            );
+            acc
+        })
+    }
+
+    pub struct BlindData {
+        mask_key: BigUint,
+        data: Vec<BigUint>,
+    }
+    
+    pub fn blind_data(product_number: &ProductNumber, data: &[u8]) -> BlindData {
+        let mask_key = BigUint::one()
+            .modinv(product_number)
+            .expect("Generation of random multiplicative failed");
+        let mask_multiplicative = {
+            mask_key.modpow(&PUBLIC_NUMBER, product_number)
+        };
+        let chunk_size = calc_chunk_size(product_number);
+        BlindData {
+            data: {
+                data.chunks(chunk_size)
+                    .map(|data_chunk| {
+                        BigUint::from_bytes_le(data_chunk) * mask_multiplicative.clone()
+                    })
+                    .collect::<Vec<_>>()
+            },
+            mask_key
+        }
+    }
+
+    pub fn unblind_data(product_number: &ProductNumber, blind_data: &BlindData) -> Vec<u8> {
+        let mask_key_mul_inverse = blind_data.mask_key.modinv(product_number)
+            .expect("Failed to cal modular multiplicative inverse");
+        blind_data.data.iter().fold(Vec::new(), |mut acc, chunk| {
+            acc.extend((chunk * mask_key_mul_inverse.clone()).to_bytes_le() );
+            acc
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{blind_data, cipher_data, decipher_data, unblind_data, KeyPair};
+
+        #[test]
+        fn test_ciphering() {
+            let r = KeyPair::new();
+            let message = "message";
+            let ciphered_data = cipher_data(&r.get_public_key_ref(), message.as_bytes());
+            let deciphered_data = decipher_data(&r.get_private_key_ref(), &ciphered_data);
+            let deciphered_message = String::from_utf8(deciphered_data.0).unwrap();
+            assert_eq!(deciphered_message, message);
+            println!("{}", deciphered_message);
         }
 
-        impl KeyRef for PrivateKeyRef<'_> {
-            fn get_parts(&self) -> (&BigUint, &ProductNumber) {
-                (self.private_number, self.product_number)
-            }
+        #[test]
+        fn test_blinding() {
+            let r = KeyPair::new();
+            let message = "message";
+            let blinded_data = blind_data(r.get_product_number(), message.as_bytes());
+            let unblinded_data = unblind_data(r.get_product_number(), &blinded_data);
+            let unblined_message = String::from_utf8(unblinded_data).unwrap();
+            assert_eq!(unblined_message, message);
+            println!("{}", unblined_message);
         }
 
-        impl KeyRef for PublicKeyRef<'_> {
-            fn get_parts(&self) -> (&BigUint, &ProductNumber) {
-                (&PUBLIC_NUMBER, self.product_number)
-            }
-        }
-
-        fn apply_key(data: &BigUint, key: &impl KeyRef) -> Option<BigUint> {
-            let (exp, modulus) = key.get_parts();
-            if data > &modulus.0 {
-                return None;
-            }
-            Some(data.modpow(exp, &modulus.0))
-        }
-
-        #[cfg(test)]
-        mod tests {
-            use super::{apply_key, quad_fold_hash, KeyPair};
-
-            #[test]
-            fn test_sign_verify() {
-                let r = KeyPair::new();
-                r.get_product_number();
-
-                let message_hash = quad_fold_hash(r.get_product_number(), "message".as_bytes());
-
-                let encrypted_hash = apply_key(&message_hash, &r.get_private_key_ref()).unwrap();
-                assert_eq!(apply_key(&encrypted_hash, &r.get_public_key_ref()).unwrap(), message_hash);
-
-                let encrypted_hash = apply_key(&message_hash, &r.get_private_key_ref()).unwrap();
-                assert_eq!(apply_key(&encrypted_hash, &r.get_public_key_ref()).unwrap(), message_hash);
-            }
-        }
     }
 }
 
@@ -203,6 +260,23 @@ mod voter {
         id: BigUint
     }
 
+    #[derive(Serialize)]
+    struct CandidateIdRef<'a> {
+        candidate: &'a str,
+        id: &'a BigUint
+    }
+
+    struct SerializedCandidateId(Vec<u8>);
+
+    #[derive(Serialize, Deserialize)]
+    struct MaskedCandidateId(Vec<BigUint>);
+
+    #[derive(Serialize, Deserialize)]
+    struct PacketsData {
+        masked_candidate_ids: Vec<MaskedCandidateId>,
+        mask_key: BigUint,
+    }
+
     impl Voter {
         pub fn new() -> Self {
             Self {
@@ -211,28 +285,32 @@ mod voter {
             }
         }
 
-        pub fn produce_packets(
-            &self,
+        pub fn produce_packets<'a>(
+            &'a self,
             packets_numer: std::num::NonZeroUsize,
-            candidates: impl Iterator<Item=&str>,
+            candidates: impl Iterator<Item=&'a str> + Clone,
             cec_public_key: &PublicKeyRef
         ) {
-            let vec_serialized_candidate_with_id_pairs = {
+            let ser_candidate_ids = {
                 (0..packets_numer.get())
                     .into_iter()
                     .map(|_| {
                         let candidate_id_pairs = {
-                            candidates.map(|c| (c, &self.id)).collect::<Vec<_>>()
+                            candidates.clone().map(|c| {
+                                CandidateIdRef {candidate: c, id: &self.id }
+                            }).collect::<Vec<_>>()
                         };
-                        bincode::serialize(&candidate_id_pairs)
-                            .expect("Failed to serialize candidate_id_pairs")
+                        SerializedCandidateId(
+                            bincode::serialize(&candidate_id_pairs)
+                                .expect("Failed to serialize candidate_id_pairs")
+                        )
                     })
                     .collect::<Vec<_>>()
             };
             let mask_key = BigUint::one()
                 .modinv(&self.key_pair.get_product_number())
                 .expect("Generation of random multiplicative failed");
-            let vec_masked_candidate_with_id_pairs = {
+            let masked_candidate_ids = {
                 let chunk_size = {
                     let bits = self.key_pair.get_product_number().bits() as usize;
                     assert!(bits >= 2);
@@ -241,20 +319,25 @@ mod voter {
                 let mask_multiplicative = {
                     mask_key.modpow(&rsa::PUBLIC_NUMBER, cec_public_key.get_product_number())
                 };
-                vec_serialized_candidate_with_id_pairs.into_iter()
+                ser_candidate_ids.into_iter()
                     .map(|serialized_candidate_id_pair| {
-                        serialized_candidate_id_pair.windows(chunk_size)
-                            .map(|data_chunk| {
-                                BigUint::from_bytes_le(data_chunk) * mask_multiplicative
-                            })
-                            .collect::<Vec<_>>()
+                        MaskedCandidateId(
+                            serialized_candidate_id_pair.0.chunks(chunk_size)
+                                .map(|data_chunk| {
+                                    BigUint::from_bytes_le(data_chunk) * mask_multiplicative.clone()
+                                })
+                                .collect::<Vec<_>>()
+                        )
                     })
                     .collect::<Vec<_>>()
             };
+            let packets_data = PacketsData{masked_candidate_ids, mask_key};
 
 
-            let masked_serialized = bincode::serialize(&masked)
-                .expect("Failed to serialize masked packet");
+
+
+            // let masked_serialized = bincode::serialize(&masked)
+            //     .expect("Failed to serialize masked packet");
 
 
         }
@@ -279,8 +362,10 @@ mod voter {
 
 #[cfg(test)]
 mod tests {
+    use serde::{Deserialize, Serialize};
+
     #[test]
-    fn test_serialization() {
+    fn test_serialization_1() {
         let n = "message";
 
         let k = bincode::serialize(n).unwrap();
@@ -288,6 +373,28 @@ mod tests {
         let a: String = bincode::deserialize(&k).unwrap();
 
         println!("{}", a);
+    }
+    #[test]
+    fn test_serialization_2() {
+        #[derive(Serialize, Debug)]
+        struct SomeRef<'a> {
+            massage: &'a str,
+            number: &'a usize
+        }
+
+        #[derive(Deserialize, Debug)]
+        struct SomeValue {
+            massage: String,
+            number: usize
+        }
+
+        let num = 10usize;
+        let some_ref = SomeRef { massage: "fdsfdsf", number: &num };
+        let serialized = bincode::serialize(&some_ref).unwrap();
+        let some_value: SomeValue = bincode::deserialize(&serialized).unwrap();
+
+        println!("{:?}", some_ref);
+        println!("{:?}", some_value);
     }
 }
 

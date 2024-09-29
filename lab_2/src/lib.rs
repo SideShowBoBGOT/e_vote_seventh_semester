@@ -95,8 +95,8 @@ mod rsa {
     }
 
     lazy_static! {
-            pub static ref DEFAULT_KEY_PAIR: KeyPair = KeyPair::new();
-        }
+        pub static ref DEFAULT_KEY_PAIR: KeyPair = KeyPair::new();
+    }
 
     impl KeyPair {
         pub fn new() -> Self {
@@ -175,43 +175,65 @@ mod rsa {
         })
     }
 
-    pub struct BlindData {
-        mask_key: BigUint,
-        data: Vec<BigUint>,
-    }
-    
-    pub fn blind_data(product_number: &ProductNumber, data: &[u8]) -> BlindData {
-        let mask_key = BigUint::one()
-            .modinv(product_number)
-            .expect("Generation of random multiplicative failed");
-        let mask_multiplicative = {
-            mask_key.modpow(&PUBLIC_NUMBER, product_number)
-        };
-        let chunk_size = calc_chunk_size(product_number);
-        BlindData {
-            data: {
-                data.chunks(chunk_size)
-                    .map(|data_chunk| {
-                        BigUint::from_bytes_le(data_chunk) * mask_multiplicative.clone()
-                    })
-                    .collect::<Vec<_>>()
-            },
-            mask_key
+    pub struct BlindKey(BigUint);
+    impl BlindKey {
+        pub fn new(product_number: &ProductNumber) -> Self {
+            Self (
+                BigUint::one()
+                .modinv(product_number)
+                .expect("Generation of random multiplicative failed")
+            )
+
         }
     }
 
-    pub fn unblind_data(product_number: &ProductNumber, blind_data: &BlindData) -> Vec<u8> {
-        let mask_key_mul_inverse = blind_data.mask_key.modinv(product_number)
-            .expect("Failed to cal modular multiplicative inverse");
-        blind_data.data.iter().fold(Vec::new(), |mut acc, chunk| {
-            acc.extend((chunk * mask_key_mul_inverse.clone()).to_bytes_le() );
-            acc
-        })
+    pub struct ApplyBlindingOps {
+        mask_multiplicative: BigUint,
+        chunk_size: usize,
+    }
+
+    impl ApplyBlindingOps {
+        pub fn new(blind_key: &BlindKey, product_number: &ProductNumber) -> Self {
+            let mask_multiplicative = {
+                blind_key.0.modpow(&PUBLIC_NUMBER, product_number)
+            };
+            let chunk_size = calc_chunk_size(product_number);
+            Self { mask_multiplicative, chunk_size }
+        }
+        pub fn apply(&self, data: &[u8]) -> Vec<BigUint> {
+            data.chunks(self.chunk_size)
+                .map(|data_chunk| {
+                    BigUint::from_bytes_le(data_chunk) * self.mask_multiplicative.clone()
+                })
+                .collect::<Vec<_>>()
+        }
+    }
+
+    pub struct UnapplyBlindingOps {
+        mask_multiplicative_inverse: BigUint,
+    }
+
+    impl UnapplyBlindingOps {
+        pub fn new(blind_key: &BlindKey, product_number: &ProductNumber) -> Self {
+            Self {
+                mask_multiplicative_inverse: {
+                    blind_key.0.modinv(product_number)
+                        .expect("Failed to cal modular multiplicative inverse")
+                }
+            }
+        }
+
+        pub fn apply(&self, data: &[BigUint]) -> Vec<u8> {
+            data.iter().fold(Vec::new(), |mut acc, chunk| {
+                acc.extend((chunk * self.mask_multiplicative_inverse.clone()).to_bytes_le() );
+                acc
+            })    
+        }
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{blind_data, cipher_data, decipher_data, unblind_data, KeyPair};
+        use super::{cipher_data, decipher_data, ApplyBlindingOps, BlindKey, KeyPair, UnapplyBlindingOps};
 
         #[test]
         fn test_ciphering() {
@@ -226,11 +248,17 @@ mod rsa {
 
         #[test]
         fn test_blinding() {
-            let r = KeyPair::new();
+            let sender = KeyPair::new();
+            let receiver = KeyPair::new();
             let message = "message";
-            let blinded_data = blind_data(r.get_product_number(), message.as_bytes());
-            let unblinded_data = unblind_data(r.get_product_number(), &blinded_data);
+            let blind_key = BlindKey::new(sender.get_product_number());
+            let apply_blinding_ops = ApplyBlindingOps::new(&blind_key, receiver.get_product_number());
+            let unapply_blinding_ops = UnapplyBlindingOps::new(&blind_key, receiver.get_product_number());
+
+            let blinded_data = apply_blinding_ops.apply(message.as_bytes());
+            let unblinded_data = unapply_blinding_ops.apply(&blinded_data);
             let unblined_message = String::from_utf8(unblinded_data).unwrap();
+
             assert_eq!(unblined_message, message);
             println!("{}", unblined_message);
         }

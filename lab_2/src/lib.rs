@@ -1,5 +1,7 @@
 extern crate derive_more;
 
+use serde::{Deserialize, Serialize};
+
 mod rsa {
     use std::ops::Rem;
     use derive_more::Deref;
@@ -8,6 +10,8 @@ mod rsa {
     use num_bigint::{BigUint};
     use num_traits::{One, ToBytes, Zero};
     use rand::Rng;
+    use serde::{Deserialize, Serialize};
+    use thiserror::Error;
 
     const MIN_GENERATED_NUMBER: u32 = u16::MAX as u32;
     const MAX_GENERATED_NUMBER: u32 = u32::MAX;
@@ -132,13 +136,13 @@ mod rsa {
         fn get_parts(&self) -> (&BigUint, &ProductNumber);
     }
 
-    impl KeyRef for PrivateKeyRef<'_> {
+    impl<'a> KeyRef for PrivateKeyRef<'a> {
         fn get_parts(&self) -> (&BigUint, &ProductNumber) {
             (self.private_number, self.product_number)
         }
     }
 
-    impl KeyRef for PublicKeyRef<'_> {
+    impl<'a> KeyRef for PublicKeyRef<'a> {
         fn get_parts(&self) -> (&BigUint, &ProductNumber) {
             (&PUBLIC_NUMBER, self.product_number)
         }
@@ -150,40 +154,34 @@ mod rsa {
         bits - 1
     }
 
-    pub struct CipheredData(Vec<BigUint>);
-    pub struct DecipheredData(Vec<u8>);
-
-    pub fn cipher_data(key: &impl KeyRef, data: &[u8]) -> CipheredData {
+    pub fn cipher_data(key: &impl KeyRef, data: &[u8]) -> Vec<BigUint> {
         let (part, product_number) = key.get_parts();
         let chunk_size = calc_chunk_size(product_number);
-        CipheredData(
-            data.chunks(chunk_size)
-                .map(|data_chunk| {
-                    BigUint::from_bytes_le(data_chunk).modpow(part, product_number)
-                })
-                .collect::<Vec<_>>()
-        )
+        data.chunks(chunk_size)
+            .map(|data_chunk| {
+                BigUint::from_bytes_le(data_chunk).modpow(part, product_number)
+            })
+            .collect::<Vec<_>>()
     }
 
-    pub fn decipher_data(key: &impl KeyRef, ciphered_data: &CipheredData) -> DecipheredData {
+    pub fn decipher_data(key: &impl KeyRef, ciphered_data: &[BigUint]) -> Vec<u8> {
         let (part, product_number) = key.get_parts();
-        ciphered_data.0.iter().fold(DecipheredData(Vec::new()), |mut acc, chunk| {
-            acc.0.extend(
-                chunk.modpow(part, product_number).to_bytes_le()
-            );
+        ciphered_data.iter().fold(Vec::new(), |mut acc, chunk| {
+            acc.extend(chunk.modpow(part, product_number).to_bytes_le());
             acc
         })
     }
 
+    #[derive(Serialize, Deserialize)]
     pub struct BlindKey(BigUint);
-    impl BlindKey {
-        pub fn new(product_number: &ProductNumber) -> Self {
-            Self (
-                BigUint::one()
-                .modinv(product_number)
-                .expect("Generation of random multiplicative failed")
-            )
+    #[derive(Error, Debug)]
+    #[error("Failed to generate blind key")]
+    pub struct BlindKeyError();
 
+    impl BlindKey {
+        pub fn new(product_number: &ProductNumber) -> Result<Self, BlindKeyError> {
+            BigUint::one().modinv(product_number).map(Self)
+                .ok_or(BlindKeyError())
         }
     }
 
@@ -209,23 +207,26 @@ mod rsa {
         }
     }
 
-    pub struct UnapplyBlindingOps {
-        mask_multiplicative_inverse: BigUint,
-    }
+    // mask_multiplicative_inverse
+    pub struct UnapplyBlindingOps(BigUint);
+
+
+    #[derive(Error, Debug)]
+    #[error("Failed to cal modular multiplicative inverse")]
+    pub struct UnapplyBlindingOpsError();
 
     impl UnapplyBlindingOps {
-        pub fn new(blind_key: &BlindKey, product_number: &ProductNumber) -> Self {
-            Self {
-                mask_multiplicative_inverse: {
-                    blind_key.0.modinv(product_number)
-                        .expect("Failed to cal modular multiplicative inverse")
-                }
-            }
+        pub fn new(
+            blind_key: &BlindKey,
+            product_number: &ProductNumber
+        ) -> Result<Self, UnapplyBlindingOpsError> {
+            blind_key.0.modinv(product_number).map(Self)
+                .ok_or(UnapplyBlindingOpsError())
         }
 
         pub fn apply(&self, data: &[BigUint]) -> Vec<u8> {
             data.iter().fold(Vec::new(), |mut acc, chunk| {
-                acc.extend((chunk * self.mask_multiplicative_inverse.clone()).to_bytes_le() );
+                acc.extend((chunk * self.0.clone()).to_bytes_le() );
                 acc
             })    
         }
@@ -233,15 +234,22 @@ mod rsa {
 
     #[cfg(test)]
     mod tests {
-        use super::{cipher_data, decipher_data, ApplyBlindingOps, BlindKey, KeyPair, UnapplyBlindingOps};
+        use super::{
+            cipher_data, decipher_data, ApplyBlindingOps,
+            BlindKey, KeyPair, UnapplyBlindingOps
+        };
 
         #[test]
         fn test_ciphering() {
             let r = KeyPair::new();
             let message = "message";
-            let ciphered_data = cipher_data(&r.get_public_key_ref(), message.as_bytes());
-            let deciphered_data = decipher_data(&r.get_private_key_ref(), &ciphered_data);
-            let deciphered_message = String::from_utf8(deciphered_data.0).unwrap();
+            let ciphered_data = cipher_data(
+                &r.get_public_key_ref(), message.as_bytes()
+            );
+            let deciphered_data = decipher_data(
+                &r.get_private_key_ref(), &ciphered_data
+            );
+            let deciphered_message = String::from_utf8(deciphered_data).unwrap();
             assert_eq!(deciphered_message, message);
             println!("{}", deciphered_message);
         }
@@ -251,9 +259,13 @@ mod rsa {
             let sender = KeyPair::new();
             let receiver = KeyPair::new();
             let message = "message";
-            let blind_key = BlindKey::new(sender.get_product_number());
+            let blind_key = {
+                BlindKey::new(sender.get_product_number()).unwrap()
+            };
             let apply_blinding_ops = ApplyBlindingOps::new(&blind_key, receiver.get_product_number());
-            let unapply_blinding_ops = UnapplyBlindingOps::new(&blind_key, receiver.get_product_number());
+            let unapply_blinding_ops = {
+                UnapplyBlindingOps::new(&blind_key, receiver.get_product_number()).unwrap()
+            };
 
             let blinded_data = apply_blinding_ops.apply(message.as_bytes());
             let unblinded_data = unapply_blinding_ops.apply(&blinded_data);
@@ -269,10 +281,17 @@ mod rsa {
 mod voter {
     use getset::Getters;
     use num_bigint::BigUint;
-    use num_traits::One;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use thiserror::Error;
     use crate::rsa;
-    use crate::rsa::PublicKeyRef;
+    use crate::rsa::BlindKeyError;
+
+    #[derive(Getters, Serialize, Deserialize)]
+    #[getset(get = "pub with_prefix")]
+    pub(crate) struct PacketsData {
+        blinded_candidate_ids: Vec<BlindedCandidateId>,
+        blind_key: rsa::BlindKey,
+    }
 
     #[derive(Getters, Clone)]
     #[getset(get = "pub with_prefix")]
@@ -294,15 +313,20 @@ mod voter {
         id: &'a BigUint
     }
 
-    struct SerializedCandidateId(Vec<u8>);
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct SerializedCandidateId(Vec<u8>);
 
     #[derive(Serialize, Deserialize)]
-    struct MaskedCandidateId(Vec<BigUint>);
+    pub struct BlindedCandidateId(Vec<BigUint>);
 
-    #[derive(Serialize, Deserialize)]
-    struct PacketsData {
-        masked_candidate_ids: Vec<MaskedCandidateId>,
-        mask_key: BigUint,
+    #[derive(Error, Debug)]
+    pub enum ProducePacketsError {
+        #[error("Failed to serialize candidate_id_pairs: {0}")]
+        FailedSerializedCandidateId(bincode::Error),
+        #[error(transparent)]
+        BlindKeyError(#[from] BlindKeyError),
+        #[error("Failed to serialize packets_data: {0}")]
+        FailedToSerializePackets(bincode::Error),
     }
 
     impl Voter {
@@ -315,59 +339,48 @@ mod voter {
 
         pub fn produce_packets<'a>(
             &'a self,
-            packets_numer: std::num::NonZeroUsize,
+            packets_number: std::num::NonZeroUsize,
             candidates: impl Iterator<Item=&'a str> + Clone,
-            cec_public_key: &PublicKeyRef
-        ) {
+            cec_public_key: &rsa::PublicKeyRef
+        ) -> Result<Vec<BigUint>, ProducePacketsError> {
             let ser_candidate_ids = {
-                (0..packets_numer.get())
-                    .into_iter()
-                    .map(|_| {
-                        let candidate_id_pairs = {
-                            candidates.clone().map(|c| {
-                                CandidateIdRef {candidate: c, id: &self.id }
-                            }).collect::<Vec<_>>()
-                        };
-                        SerializedCandidateId(
-                            bincode::serialize(&candidate_id_pairs)
-                                .expect("Failed to serialize candidate_id_pairs")
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                let candidate_id_pairs = {
+                    candidates.clone().map(|c| {
+                        CandidateIdRef {candidate: c, id: &self.id }
+                    }).collect::<Vec<_>>()
+                };
+                match bincode::serialize(&candidate_id_pairs) {
+                    Ok(serialized_candidate_ids) => {
+                        vec![
+                            SerializedCandidateId(serialized_candidate_ids);
+                            packets_number.get()
+                        ]
+                    },
+                    Err(err) => {
+                        return Err(ProducePacketsError::FailedSerializedCandidateId(err));
+                    }
+                }
             };
-            let mask_key = BigUint::one()
-                .modinv(&self.key_pair.get_product_number())
-                .expect("Generation of random multiplicative failed");
-            let masked_candidate_ids = {
-                let chunk_size = {
-                    let bits = self.key_pair.get_product_number().bits() as usize;
-                    assert!(bits >= 2);
-                    bits - 1
-                };
-                let mask_multiplicative = {
-                    mask_key.modpow(&rsa::PUBLIC_NUMBER, cec_public_key.get_product_number())
-                };
+            let blind_key = {
+                rsa::BlindKey::new(self.key_pair.get_product_number())
+                    .map_err(ProducePacketsError::BlindKeyError)?
+            };
+            let apply_blinding_ops = rsa::ApplyBlindingOps::new(
+                &blind_key, cec_public_key.get_product_number()
+            );
+            let blinded_candidate_ids = {
                 ser_candidate_ids.into_iter()
-                    .map(|serialized_candidate_id_pair| {
-                        MaskedCandidateId(
-                            serialized_candidate_id_pair.0.chunks(chunk_size)
-                                .map(|data_chunk| {
-                                    BigUint::from_bytes_le(data_chunk) * mask_multiplicative.clone()
-                                })
-                                .collect::<Vec<_>>()
+                    .map(|candidate_id| {
+                        BlindedCandidateId(
+                            apply_blinding_ops.apply(&candidate_id.0)
                         )
                     })
                     .collect::<Vec<_>>()
             };
-            let packets_data = PacketsData{masked_candidate_ids, mask_key};
-
-
-
-
-            // let masked_serialized = bincode::serialize(&masked)
-            //     .expect("Failed to serialize masked packet");
-
-
+            let packets_data = PacketsData{blinded_candidate_ids, blind_key};
+            bincode::serialize(&packets_data)
+                .map(|packet_data| rsa::cipher_data(cec_public_key, &packet_data))
+                .map_err(|err| ProducePacketsError::FailedToSerializePackets(err))
         }
         //
         // pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
@@ -395,13 +408,11 @@ mod tests {
     #[test]
     fn test_serialization_1() {
         let n = "message";
-
         let k = bincode::serialize(n).unwrap();
-
         let a: String = bincode::deserialize(&k).unwrap();
-
         println!("{}", a);
     }
+
     #[test]
     fn test_serialization_2() {
         #[derive(Serialize, Debug)]
@@ -426,102 +437,124 @@ mod tests {
     }
 }
 
-// mod cec {
-//     use std::collections::HashMap;
-//     use thiserror::Error;
-//     use crate::rsa;
-//     use crate::{gamming_cipher, voter};
-//     use crate::rsa::PublicKey;
-//
-//     pub struct CEC {
-//         candidates: HashMap<String, u64>,
-//         voters_state: HashMap<rsa::PublicKey, VoterState>,
-//         key_pair: rsa::KeyPair,
-//     }
-//
-//     #[derive(Error, Debug, PartialEq, Eq)]
-//     pub enum VoteError {
-//         #[error("Gamming keys do not match")]
-//         GammingKeyHashedNotMatch,
-//         #[error("Failed parse gamming key")]
-//         FailedParseGammingKey,
-//         #[error("Failed parse candidate")]
-//         FailedParseCandidate,
-//         #[error("Invalid candidate")]
-//         CandidateNotRegistered,
-//         #[error("Voter has already voted")]
-//         VoterAlreadyVoted,
-//         #[error("Voter can not vote")]
-//         VoterCanNotVote,
-//         #[error("Voter is not registered")]
-//         VoterNotRegistered
-//     }
-//
-//     #[derive(Debug)]
-//     pub enum VoterState {
-//         CanVote,
-//         CanNotVote,
-//         Voted,
-//     }
-//
-//     impl CEC {
-//         pub fn new<I>(candidates: I, voters_state: HashMap<rsa::PublicKey, VoterState>) -> Self
-//         where I: Iterator<Item=String> {
-//             Self {
-//                 candidates: HashMap::from_iter(candidates.map(|c| (c, 0u64))),
-//                 voters_state,
-//                 key_pair: rsa::KeyPair::new()
-//             }
-//         }
-//
-//         pub fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)
-//                             -> Result<(), VoteError> {
-//             if let Some(state) = self.voters_state.get_mut(voter_key) {
-//                 match state {
-//                     VoterState::Voted => Err(VoteError::VoterAlreadyVoted),
-//                     VoterState::CanNotVote => Err(VoteError::VoterCanNotVote),
-//                     VoterState::CanVote => {
-//                         let hash = voter_key.quad_fold_hash(vote_data.get_gammed_vote());
-//                         let decrypted_hash = voter_key.apply(vote_data.get_rsa_signature()).unwrap();
-//
-//                         if hash == decrypted_hash {
-//                             if let Some(gamming_key) = self.key_pair.get_private_key()
-//                                 .apply(vote_data.get_encrypted_gamming_key()) {
-//                                 if let Ok(candidate) = String::from_utf8(
-//                                     gamming_cipher(vote_data.get_gammed_vote(), &gamming_key.to_bytes_le())
-//                                 ) {
-//                                     if let Some(score) = self.candidates.get_mut(candidate.as_str()) {
-//                                         *state = VoterState::Voted;
-//                                         *score += 1;
-//                                         Ok(())
-//                                     } else {
-//                                         Err(VoteError::CandidateNotRegistered)
-//                                     }
-//                                 } else {
-//                                     Err(VoteError::FailedParseCandidate)
-//                                 }
-//                             } else {
-//                                 Err(VoteError::FailedParseGammingKey)
-//                             }
-//                         } else {
-//                             Err(VoteError::GammingKeyHashedNotMatch)
-//                         }
-//                     }
-//                 }
-//             } else {
-//                 Err(VoteError::VoterNotRegistered)
-//             }
-//         }
-//
-//         pub fn get_candidates(&self) -> &HashMap<String, u64> {
-//             &self.candidates
-//         }
-//
-//         pub fn get_public_key(&self) -> PublicKey {
-//             self.key_pair.get_public_key()
-//         }
-//     }
-// }
+mod cec {
+    use std::collections::HashMap;
+    use num_bigint::BigUint;
+    use thiserror::Error;
+    use crate::{rsa, voter};
+
+    pub struct CEC<'a> {
+        candidates: HashMap<String, u64>,
+        voters_state: HashMap<rsa::PublicKeyRef<'a>, VoterState>,
+        key_pair: rsa::KeyPair,
+    }
+
+    #[derive(Error, Debug, PartialEq, Eq)]
+    pub enum VoteError {
+        #[error("Gamming keys do not match")]
+        GammingKeyHashedNotMatch,
+        #[error("Failed parse gamming key")]
+        FailedParseGammingKey,
+        #[error("Failed parse candidate")]
+        FailedParseCandidate,
+        #[error("Invalid candidate")]
+        CandidateNotRegistered,
+        #[error("Voter has already voted")]
+        VoterAlreadyVoted,
+        #[error("Voter can not vote")]
+        VoterCanNotVote,
+        #[error("Voter is not registered")]
+        VoterNotRegistered
+    }
+
+    #[derive(Debug)]
+    pub enum VoterState {
+        CanVote,
+        CanNotVote,
+        Voted,
+    }
+
+    impl<'a> CEC<'a> {
+        pub fn new<I>(
+            candidates: impl Iterator<Item=String>,
+            voters_state: HashMap<rsa::PublicKeyRef<'a>, VoterState>
+        ) -> Self {
+            Self {
+                candidates: HashMap::from_iter(
+                    candidates.map(|c| (c, 0u64))
+                ),
+                voters_state,
+                key_pair: rsa::KeyPair::new()
+            }
+        }
+
+        pub fn consume_packets(
+            &mut self,
+            ciphered_data: &[BigUint],
+            packets_to_open: std::num::NonZeroUsize,
+        ) {
+            let deciphered_data = rsa::decipher_data(
+                &self.key_pair.get_private_key_ref(), ciphered_data
+            );
+            let packet_data: voter::PacketsData = bincode::deserialize(&deciphered_data)
+                .expect("Failed to deserialize packets_data");
+
+
+
+        }
+
+        fn do_consume_packets() {
+
+        }
+
+        // pub fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)
+        //                     -> Result<(), VoteError> {
+        //     if let Some(state) = self.voters_state.get_mut(voter_key) {
+        //         match state {
+        //             VoterState::Voted => Err(VoteError::VoterAlreadyVoted),
+        //             VoterState::CanNotVote => Err(VoteError::VoterCanNotVote),
+        //             VoterState::CanVote => {
+        //                 let hash = voter_key.quad_fold_hash(vote_data.get_gammed_vote());
+        //                 let decrypted_hash = voter_key.apply(vote_data.get_rsa_signature()).unwrap();
+        //
+        //                 if hash == decrypted_hash {
+        //                     if let Some(gamming_key) = self.key_pair.get_private_key()
+        //                         .apply(vote_data.get_encrypted_gamming_key()) {
+        //                         if let Ok(candidate) = String::from_utf8(
+        //                             gamming_cipher(vote_data.get_gammed_vote(), &gamming_key.to_bytes_le())
+        //                         ) {
+        //                             if let Some(score) = self.candidates.get_mut(candidate.as_str()) {
+        //                                 *state = VoterState::Voted;
+        //                                 *score += 1;
+        //                                 Ok(())
+        //                             } else {
+        //                                 Err(VoteError::CandidateNotRegistered)
+        //                             }
+        //                         } else {
+        //                             Err(VoteError::FailedParseCandidate)
+        //                         }
+        //                     } else {
+        //                         Err(VoteError::FailedParseGammingKey)
+        //                     }
+        //                 } else {
+        //                     Err(VoteError::GammingKeyHashedNotMatch)
+        //                 }
+        //             }
+        //         }
+        //     } else {
+        //         Err(VoteError::VoterNotRegistered)
+        //     }
+        // }
+
+        // pub fn get_candidates(&self) -> &HashMap<String, u64> {
+        //     &self.candidates
+        // }
+
+        // pub fn get_public_key(&self) -> PublicKey {
+        //     self.key_pair.get_public_key()
+        // }
+    }
+}
 
 // #[cfg(test)]
 // mod tests {

@@ -210,7 +210,6 @@ mod rsa {
     // mask_multiplicative_inverse
     pub struct UnapplyBlindingOps(BigUint);
 
-
     #[derive(Error, Debug)]
     #[error("Failed to cal modular multiplicative inverse")]
     pub struct UnapplyBlindingOpsError();
@@ -274,7 +273,6 @@ mod rsa {
             assert_eq!(unblined_message, message);
             println!("{}", unblined_message);
         }
-
     }
 }
 
@@ -313,15 +311,22 @@ mod voter {
         id: &'a BigUint
     }
 
+    #[derive(Deserialize, Getters)]
+    #[getset(get = "pub with_prefix")]
+    pub struct CandidateId {
+        candidate: String,
+        id: BigUint
+    }
+
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SerializedCandidateId(Vec<u8>);
 
     #[derive(Serialize, Deserialize)]
-    pub struct BlindedCandidateId(Vec<BigUint>);
+    pub struct BlindedCandidateId(pub Vec<BigUint>);
 
     #[derive(Error, Debug)]
     pub enum ProducePacketsError {
-        #[error("Failed to serialize candidate_id_pairs: {0}")]
+        #[error("Failed to serialize candidate_id: {0}")]
         FailedSerializedCandidateId(bincode::Error),
         #[error(transparent)]
         BlindKeyError(#[from] BlindKeyError),
@@ -442,10 +447,11 @@ mod cec {
     use num_bigint::BigUint;
     use thiserror::Error;
     use crate::{rsa, voter};
+    use crate::voter::CandidateId;
 
-    pub struct CEC<'a> {
+    pub struct CEC {
         candidates: HashMap<String, u64>,
-        voters_state: HashMap<rsa::PublicKeyRef<'a>, VoterState>,
+        voters_state: HashMap<BigUint, VoterState>,
         key_pair: rsa::KeyPair,
     }
 
@@ -467,17 +473,89 @@ mod cec {
         VoterNotRegistered
     }
 
-    #[derive(Debug)]
-    pub enum VoterState {
-        CanVote,
-        CanNotVote,
-        Voted,
+    #[derive(Debug, PartialEq, Eq, Clone)]
+    pub enum CanVoteState {
+        NotRegistered,
+        Registered,
+        Voted
     }
 
-    impl<'a> CEC<'a> {
+    #[derive(Debug, Clone)]
+    pub enum VoterState {
+        CanVote(CanVoteState),
+        CanNotVote,
+    }
+
+    #[derive(Error, Debug)]
+    pub enum ConsumePacketsError {
+        #[error("Failed to deserialize packets_data: {0}")]
+        FailedToDeserializePackets(bincode::Error),
+        #[error("No packets")]
+        NoPackets,
+        #[error(transparent)]
+        FailedCreateUnapplyBlindingOps(#[from] rsa::UnapplyBlindingOpsError),
+        #[error("Failed to deserialize candidate_id: {0}")]
+        FailedDeserializedCandidateId(bincode::Error),
+        #[error(transparent)]
+        CheckCandidateIdError(#[from] CheckCandidateIdError),
+        #[error("Failed to serialize output packet")]
+        FailedSerializeOutputPacket(bincode::Error)
+    }
+
+    #[derive(Error, Debug)]
+    enum CheckCandidateIdError {
+        #[error("Invalid candidate: {0}")]
+        InvalidCandidateError(String),
+        #[error("Invalid voter id: {0}")]
+        InvalidVoterId(BigUint),
+        #[error("Invalid voter state: {0:?}")]
+        InvalidVoterState(VoterState),
+        #[error("Ids are not the same: {0} != {1}")]
+        IdsAreNotTheSame(BigUint, BigUint),
+    }
+
+    fn check_candidate_ids(
+        candidate_ids: &[CandidateId],
+        candidates: &HashMap<String, u64>,
+        voters_state: &HashMap<BigUint, VoterState>,
+    ) -> Result<(), CheckCandidateIdError> {
+        for candidate_id in candidate_ids.iter() {
+            if candidates.get(candidate_id.get_candidate()).is_none() {
+                return Err(CheckCandidateIdError::InvalidCandidateError(candidate_id.get_candidate().clone()))
+            } else {
+                if let Some(voter_state) = voters_state.get(candidate_id.get_id()) {
+                    match voter_state {
+                        VoterState::CanVote(can_vote_state) => {
+                            match can_vote_state {
+                                CanVoteState::NotRegistered => (),
+                                _ => return Err(CheckCandidateIdError::InvalidVoterState(voter_state.clone())),
+                            }
+                        },
+                        VoterState::CanNotVote => {
+                            return Err(CheckCandidateIdError::InvalidVoterState(voter_state.clone()))
+                        }
+                    }
+                } else {
+                    return Err(CheckCandidateIdError::InvalidVoterId(candidate_id.get_id().clone()))
+                }
+            }
+        }
+        if let Some(first) = candidate_ids.first() {
+            for candidate_id in candidate_ids.iter() {
+                if first.get_id() != candidate_id.get_id() {
+                    return Err(CheckCandidateIdError::IdsAreNotTheSame(
+                        first.get_id().clone(), candidate_id.get_id().clone()
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    impl CEC {
         pub fn new<I>(
             candidates: impl Iterator<Item=String>,
-            voters_state: HashMap<rsa::PublicKeyRef<'a>, VoterState>
+            voters_state: HashMap<BigUint, VoterState>
         ) -> Self {
             Self {
                 candidates: HashMap::from_iter(
@@ -490,21 +568,36 @@ mod cec {
 
         pub fn consume_packets(
             &mut self,
-            ciphered_data: &[BigUint],
-            packets_to_open: std::num::NonZeroUsize,
-        ) {
+            ciphered_data: &[BigUint]
+        ) -> Result<Vec<BigUint>, ConsumePacketsError> {
             let deciphered_data = rsa::decipher_data(
                 &self.key_pair.get_private_key_ref(), ciphered_data
             );
             let packet_data: voter::PacketsData = bincode::deserialize(&deciphered_data)
-                .expect("Failed to deserialize packets_data");
-
-
-
-        }
-
-        fn do_consume_packets() {
-
+                .map_err(ConsumePacketsError::FailedToDeserializePackets)?;
+            if packet_data.get_blinded_candidate_ids().is_empty() {
+                return Err(ConsumePacketsError::NoPackets);
+            }
+            let candidate_ids = {
+                let unapply_blinding_ops = rsa::UnapplyBlindingOps::new(
+                    packet_data.get_blind_key(),
+                    self.key_pair.get_product_number()
+                )?;
+                let mut candidate_ids = Vec::<CandidateId>::new();
+                for blinded_candidate_id in packet_data
+                    .get_blinded_candidate_ids().iter().skip(1) {
+                    let candidate_id_data = unapply_blinding_ops.apply(&blinded_candidate_id.0);
+                    let candidate_id: voter::CandidateId = bincode::deserialize(&candidate_id_data)
+                        .map_err(ConsumePacketsError::FailedDeserializedCandidateId)?;
+                    candidate_ids.push(candidate_id);
+                };
+                candidate_ids
+            };
+            check_candidate_ids(&candidate_ids, &self.candidates, &self.voters_state)
+                .map_err(Into::<ConsumePacketsError>::into)?;
+            let packet = bincode::serialize(packet_data.get_blinded_candidate_ids().first().unwrap())
+                .map_err(ConsumePacketsError::FailedSerializeOutputPacket)?;
+            Ok(rsa::cipher_data(&self.key_pair.get_private_key_ref(), &packet))
         }
 
         // pub fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)

@@ -284,10 +284,12 @@ mod voter {
     use crate::rsa;
     use crate::rsa::BlindKeyError;
 
+    pub const PACKETS_NUMBER: usize = 10;
+
     #[derive(Getters, Serialize, Deserialize)]
     #[getset(get = "pub with_prefix")]
     pub(crate) struct PacketsData {
-        blinded_candidate_ids: Vec<BlindedCandidateId>,
+        blinded_arr_candidate_ids: [BlindedCandidateIdVec; PACKETS_NUMBER],
         blind_key: rsa::BlindKey,
     }
 
@@ -299,30 +301,42 @@ mod voter {
         gammed_vote: Vec<u8>
     }
 
+    #[derive(
+        Serialize, Deserialize, Clone,
+        Default, PartialEq, Eq, Hash, Debug
+    )]
+    pub struct VoterId(pub BigUint);
+
     #[derive(Default)]
     pub struct Voter {
         key_pair: rsa::KeyPair,
-        id: BigUint
+        id: VoterId
     }
 
-    #[derive(Serialize)]
+    #[derive(Serialize, Clone)]
     struct CandidateIdRef<'a> {
         candidate: &'a str,
-        id: &'a BigUint
+        id: &'a VoterId
     }
 
-    #[derive(Deserialize, Getters)]
+    #[derive(Deserialize, Getters, Default, Clone)]
     #[getset(get = "pub with_prefix")]
     pub struct CandidateId {
         candidate: String,
-        id: BigUint
+        id: VoterId
     }
 
-    #[derive(Serialize, Deserialize, Clone)]
-    pub struct SerializedCandidateId(Vec<u8>);
+    #[derive(Deserialize, Default, Clone)]
+    pub struct CandidateIdVec(Vec<CandidateId>);
 
-    #[derive(Serialize, Deserialize)]
-    pub struct BlindedCandidateId(pub Vec<BigUint>);
+    #[derive(Serialize, Default, Clone)]
+    pub struct CandidateIdRefVec<'a>(Vec<CandidateIdRef<'a>>);
+
+    #[derive(Serialize, Deserialize, Clone, Default)]
+    pub struct SerializedCandidateIdVec(pub Vec<u8>);
+
+    #[derive(Serialize, Deserialize, Default, Clone)]
+    pub struct BlindedCandidateIdVec(pub Vec<BigUint>);
 
     #[derive(Error, Debug)]
     pub enum ProducePacketsError {
@@ -338,33 +352,30 @@ mod voter {
         pub fn new() -> Self {
             Self {
                 key_pair: rsa::KeyPair::new(),
-                id: rsa::generate_num()
+                id: VoterId(rsa::generate_num())
             }
         }
 
         pub fn produce_packets<'a>(
             &'a self,
-            packets_number: std::num::NonZeroUsize,
             candidates: impl Iterator<Item=&'a str> + Clone,
             cec_public_key: &rsa::PublicKeyRef
         ) -> Result<Vec<BigUint>, ProducePacketsError> {
             let ser_candidate_ids = {
-                let candidate_id_pairs = {
+                let candidate_id_pairs = CandidateIdRefVec(
                     candidates.clone().map(|c| {
                         CandidateIdRef {candidate: c, id: &self.id }
                     }).collect::<Vec<_>>()
-                };
-                match bincode::serialize(&candidate_id_pairs) {
-                    Ok(serialized_candidate_ids) => {
-                        vec![
-                            SerializedCandidateId(serialized_candidate_ids);
-                            packets_number.get()
-                        ]
-                    },
-                    Err(err) => {
-                        return Err(ProducePacketsError::FailedSerializedCandidateId(err));
-                    }
-                }
+                );
+                bincode::serialize(&candidate_id_pairs)
+                    .map_err(ProducePacketsError::FailedSerializedCandidateId)
+                    .map(|serialized_candidate_ids| {
+                        let mut arr: [SerializedCandidateIdVec; PACKETS_NUMBER] = Default::default();
+                        for el in &mut arr {
+                            *el = SerializedCandidateIdVec(serialized_candidate_ids.clone());
+                        }
+                        arr
+                    })?
             };
             let blind_key = {
                 rsa::BlindKey::new(self.key_pair.get_product_number())
@@ -374,18 +385,24 @@ mod voter {
                 &blind_key, cec_public_key.get_product_number()
             );
             let blinded_candidate_ids = {
-                ser_candidate_ids.into_iter()
-                    .map(|candidate_id| {
-                        BlindedCandidateId(
-                            apply_blinding_ops.apply(&candidate_id.0)
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                let mut arr: [BlindedCandidateIdVec; PACKETS_NUMBER] = Default::default();
+                for (blinded, candidate_id) in arr.iter_mut().zip(ser_candidate_ids.iter_mut()) {
+                    *blinded = BlindedCandidateIdVec(apply_blinding_ops.apply(&candidate_id.0));
+                }
+                arr
             };
-            let packets_data = PacketsData{blinded_candidate_ids, blind_key};
+            let packets_data = PacketsData{ blinded_arr_candidate_ids: blinded_candidate_ids, blind_key};
             bincode::serialize(&packets_data)
                 .map(|packet_data| rsa::cipher_data(cec_public_key, &packet_data))
                 .map_err(|err| ProducePacketsError::FailedToSerializePackets(err))
+        }
+
+        pub fn accept_signed_packet_and_vote(
+            &self,
+            ciphered_blinded_vote: &[BigUint],
+            cec_public_key: &rsa::PublicKeyRef
+        ) {
+
         }
         //
         // pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
@@ -447,11 +464,11 @@ mod cec {
     use num_bigint::BigUint;
     use thiserror::Error;
     use crate::{rsa, voter};
-    use crate::voter::CandidateId;
+    use crate::voter::{CandidateId, VoterId};
 
     pub struct CEC {
         candidates: HashMap<String, u64>,
-        voters_state: HashMap<BigUint, VoterState>,
+        voters_state: HashMap<VoterId, VoterState>,
         key_pair: rsa::KeyPair,
     }
 
@@ -490,8 +507,6 @@ mod cec {
     pub enum ConsumePacketsError {
         #[error("Failed to deserialize packets_data: {0}")]
         FailedToDeserializePackets(bincode::Error),
-        #[error("No packets")]
-        NoPackets,
         #[error(transparent)]
         FailedCreateUnapplyBlindingOps(#[from] rsa::UnapplyBlindingOpsError),
         #[error("Failed to deserialize candidate_id: {0}")]
@@ -506,56 +521,57 @@ mod cec {
     enum CheckCandidateIdError {
         #[error("Invalid candidate: {0}")]
         InvalidCandidateError(String),
-        #[error("Invalid voter id: {0}")]
-        InvalidVoterId(BigUint),
+        #[error("Invalid voter id: {0:?}")]
+        InvalidVoterId(VoterId),
         #[error("Invalid voter state: {0:?}")]
         InvalidVoterState(VoterState),
-        #[error("Ids are not the same: {0} != {1}")]
-        IdsAreNotTheSame(BigUint, BigUint),
+        #[error("Ids are not the same: {0:?} != {1:?}")]
+        IdsAreNotTheSame(VoterId, VoterId),
     }
 
-    fn check_candidate_ids(
-        candidate_ids: &[CandidateId],
-        candidates: &HashMap<String, u64>,
-        voters_state: &HashMap<BigUint, VoterState>,
-    ) -> Result<(), CheckCandidateIdError> {
-        for candidate_id in candidate_ids.iter() {
-            if candidates.get(candidate_id.get_candidate()).is_none() {
-                return Err(CheckCandidateIdError::InvalidCandidateError(candidate_id.get_candidate().clone()))
-            } else {
-                if let Some(voter_state) = voters_state.get(candidate_id.get_id()) {
-                    match voter_state {
-                        VoterState::CanVote(can_vote_state) => {
-                            match can_vote_state {
-                                CanVoteState::NotRegistered => (),
-                                _ => return Err(CheckCandidateIdError::InvalidVoterState(voter_state.clone())),
-                            }
-                        },
-                        VoterState::CanNotVote => {
-                            return Err(CheckCandidateIdError::InvalidVoterState(voter_state.clone()))
-                        }
-                    }
+    fn check_candidate_ids<'a>(
+        candidate_id_vec_arr: &'a [voter::CandidateIdVec; voter::PACKETS_NUMBER - 1],
+        candidates: &'a HashMap<String, u64>,
+        voters_state: &'a HashMap<VoterId, VoterState>,
+    ) -> Result<&'a VoterId, CheckCandidateIdError> {
+        for candidate_id_vec in candidate_id_vec_arr.iter() {
+            for candidate_id in &candidate_id_vec {
+                if candidates.get(candidate_id.get_candidate()).is_none() {
+                    return Err(CheckCandidateIdError::InvalidCandidateError(candidate_id.get_candidate().clone()))
                 } else {
-                    return Err(CheckCandidateIdError::InvalidVoterId(candidate_id.get_id().clone()))
+                    if let Some(voter_state) = voters_state.get(candidate_id.get_id()) {
+                        match voter_state {
+                            VoterState::CanVote(can_vote_state) => {
+                                match can_vote_state {
+                                    CanVoteState::NotRegistered => (),
+                                    _ => return Err(CheckCandidateIdError::InvalidVoterState(voter_state.clone())),
+                                }
+                            },
+                            VoterState::CanNotVote => {
+                                return Err(CheckCandidateIdError::InvalidVoterState(voter_state.clone()))
+                            }
+                        }
+                    } else {
+                        return Err(CheckCandidateIdError::InvalidVoterId(candidate_id.get_id().clone()))
+                    }
                 }
             }
         }
-        if let Some(first) = candidate_ids.first() {
-            for candidate_id in candidate_ids.iter() {
-                if first.get_id() != candidate_id.get_id() {
-                    return Err(CheckCandidateIdError::IdsAreNotTheSame(
-                        first.get_id().clone(), candidate_id.get_id().clone()
-                    ))
-                }
+        let first = &candidate_id_vec_arr[0];
+        for candidate_id in candidate_ids.iter() {
+            if first.get_id() != candidate_id.get_id() {
+                return Err(CheckCandidateIdError::IdsAreNotTheSame(
+                    first.get_id().clone(), candidate_id.get_id().clone()
+                ))
             }
         }
-        Ok(())
+        Ok(&first.get_id())
     }
 
     impl CEC {
         pub fn new<I>(
             candidates: impl Iterator<Item=String>,
-            voters_state: HashMap<BigUint, VoterState>
+            voters_state: HashMap<VoterId, VoterState>
         ) -> Self {
             Self {
                 candidates: HashMap::from_iter(
@@ -575,28 +591,25 @@ mod cec {
             );
             let packet_data: voter::PacketsData = bincode::deserialize(&deciphered_data)
                 .map_err(ConsumePacketsError::FailedToDeserializePackets)?;
-            if packet_data.get_blinded_candidate_ids().is_empty() {
-                return Err(ConsumePacketsError::NoPackets);
-            }
             let candidate_ids = {
                 let unapply_blinding_ops = rsa::UnapplyBlindingOps::new(
                     packet_data.get_blind_key(),
                     self.key_pair.get_product_number()
                 )?;
-                let mut candidate_ids = Vec::<CandidateId>::new();
-                for blinded_candidate_id in packet_data
-                    .get_blinded_candidate_ids().iter().skip(1) {
-                    let candidate_id_data = unapply_blinding_ops.apply(&blinded_candidate_id.0);
-                    let candidate_id: voter::CandidateId = bincode::deserialize(&candidate_id_data)
+                let mut candidate_ids: [voter::CandidateIdVec; voter::PACKETS_NUMBER - 1] = Default::default();
+                for (candidate_id, blinded_candidate_id) in candidate_ids
+                    .iter_mut().zip(packet_data.get_blinded_arr_candidate_ids().iter().skip(1)) {
+                    let ser_candidate_id_vec = voter::SerializedCandidateIdVec(unapply_blinding_ops.apply(&blinded_candidate_id.0));
+                    *candidate_id = bincode::deserialize(&ser_candidate_id_vec.0)
                         .map_err(ConsumePacketsError::FailedDeserializedCandidateId)?;
-                    candidate_ids.push(candidate_id);
-                };
+                }
                 candidate_ids
             };
-            check_candidate_ids(&candidate_ids, &self.candidates, &self.voters_state)
+            let voter_id = check_candidate_ids(&candidate_ids, &self.candidates, &self.voters_state)
                 .map_err(Into::<ConsumePacketsError>::into)?;
             let packet = bincode::serialize(packet_data.get_blinded_candidate_ids().first().unwrap())
                 .map_err(ConsumePacketsError::FailedSerializeOutputPacket)?;
+            *self.voters_state[voter_id] = VoterState::CanVote(CanVoteState::Registered);
             Ok(rsa::cipher_data(&self.key_pair.get_private_key_ref(), &packet))
         }
 

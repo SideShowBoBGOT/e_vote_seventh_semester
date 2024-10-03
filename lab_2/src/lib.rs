@@ -7,7 +7,7 @@ mod rsa {
     use derive_more::Deref;
     use getset::Getters;
     use lazy_static::lazy_static;
-    use num_bigint::{BigUint};
+    use num_bigint::{BigUint, RandBigInt};
     use num_traits::{One, ToBytes, Zero};
     use rand::Rng;
     use serde::{Deserialize, Serialize};
@@ -53,18 +53,11 @@ mod rsa {
     }
 
     lazy_static! {
-            pub static ref PUBLIC_NUMBER: BigUint = BigUint::from(65537u32);
-        }
+        pub static ref PUBLIC_NUMBER: BigUint = BigUint::from(65537u32);
+    }
 
     #[derive(Debug, Clone, Deref)]
     pub struct ProductNumber(BigUint);
-
-    // #[derive(Debug, Clone, Getters)]
-    // pub struct PrivateKey {
-    //     private_number: BigUint,
-    //     #[get = "pub with_prefix"]
-    //     product_number: ProductNumber
-    // }
 
     #[derive(Debug, Getters)]
     pub struct PrivateKeyRef<'a> {
@@ -72,12 +65,6 @@ mod rsa {
         #[get = "pub with_prefix"]
         product_number: &'a ProductNumber
     }
-
-    // #[derive(Debug, Clone, Getters)]
-    // pub struct PublicKey {
-    //     #[get = "pub with_prefix"]
-    //     product_number: ProductNumber
-    // }
 
     #[derive(Debug, Getters)]
     pub struct PublicKeyRef<'a> {
@@ -100,6 +87,11 @@ mod rsa {
 
     lazy_static! {
         pub static ref DEFAULT_KEY_PAIR: KeyPair = KeyPair::new();
+    }
+
+    fn modpow(base: &BigUint, exp: &BigUint, modulus: &BigUint) -> BigUint {
+        assert!(base < modulus, "base must be less than modulus");
+        base.modpow(exp, modulus)
     }
 
     impl KeyPair {
@@ -128,7 +120,7 @@ mod rsa {
 
     fn quad_fold_hash(n: &ProductNumber, data: &[u8]) -> BigUint {
         data.iter().fold(BigUint::zero(), |acc, x| {
-            (acc + BigUint::from(*x)).modpow(&TWO, &n.0)
+            modpow(&(acc + BigUint::from(*x)), &TWO, &n.0)
         })
     }
 
@@ -148,19 +140,24 @@ mod rsa {
         }
     }
 
-    fn calc_chunk_size(product_number: &ProductNumber) -> usize {
+    pub struct SizeInBytes(pub usize);
+
+    fn calc_chunk_size(product_number: &ProductNumber) -> SizeInBytes {
         let bits = product_number.bits() as usize;
         assert!(bits >= 2);
-        bits - 1
+        let less_bits = bits - 1;
+        let size_in_bytes = less_bits / 8;
+        SizeInBytes(size_in_bytes)
     }
 
     pub fn cipher_data(key: &impl KeyRef, data: &[u8]) -> Vec<BigUint> {
         let (part, product_number) = key.get_parts();
         let chunk_size = calc_chunk_size(product_number);
-        data.chunks(chunk_size)
+        data.chunks(chunk_size.0)
             .map(|data_chunk| {
                 let val = BigUint::from_bytes_le(data_chunk);
-                let c = val.modpow(part, product_number);
+                let c = modpow(&val, part, product_number);
+                println!("{:?}", c);
                 c
             })
             .collect::<Vec<_>>()
@@ -170,8 +167,11 @@ mod rsa {
         let (part, product_number) = key.get_parts();
         let chunk_size = calc_chunk_size(product_number);
         ciphered_data.iter().fold(Vec::new(), |mut acc, chunk| {
-            let val = chunk.modpow(part, product_number);
-            let bytes = val.to_bytes_le();
+            let val = modpow(&chunk, part, product_number);
+            let mut bytes = val.to_bytes_le();
+            while bytes.len() < chunk_size.0 {
+                bytes.push(0);
+            }
             acc.extend(bytes);
             acc
         })
@@ -179,41 +179,48 @@ mod rsa {
 
     #[derive(Serialize, Deserialize)]
     pub struct BlindKey(BigUint);
-    #[derive(Error, Debug)]
-    #[error("Failed to generate blind key")]
-    pub struct BlindKeyError();
 
     impl BlindKey {
-        pub fn new(product_number: &ProductNumber) -> Result<Self, BlindKeyError> {
-            BigUint::one().modinv(product_number).map(Self)
-                .ok_or(BlindKeyError())
+        pub fn new(product_number: &ProductNumber) -> Self {
+            loop {
+                let num = rand::thread_rng().gen_biguint_below(product_number);
+                if let Some(res) = num.modinv(product_number) {
+                    break BlindKey(res);
+                }
+            }
         }
     }
 
     pub struct ApplyBlindingOps {
         mask_multiplicative: BigUint,
-        chunk_size: usize,
+        chunk_size: SizeInBytes,
     }
 
     impl ApplyBlindingOps {
         pub fn new(blind_key: &BlindKey, product_number: &ProductNumber) -> Self {
             let mask_multiplicative = {
-                blind_key.0.modpow(&PUBLIC_NUMBER, product_number)
+                modpow(&blind_key.0, &PUBLIC_NUMBER, product_number)
             };
             let chunk_size = calc_chunk_size(product_number);
             Self { mask_multiplicative, chunk_size }
         }
         pub fn apply(&self, data: &[u8]) -> Vec<BigUint> {
-            data.chunks(self.chunk_size)
+            data.chunks(self.chunk_size.0)
                 .map(|data_chunk| {
-                    BigUint::from_bytes_le(data_chunk) * self.mask_multiplicative.clone()
+                    let val = BigUint::from_bytes_le(data_chunk);
+                    let num = val * self.mask_multiplicative.clone();
+                    println!("{:?}", num);
+                    num
                 })
                 .collect::<Vec<_>>()
         }
     }
 
     // mask_multiplicative_inverse
-    pub struct UnapplyBlindingOps(BigUint);
+    pub struct UnapplyBlindingOps{
+        mask_multiplicative_inverse: BigUint,
+        chunk_size: SizeInBytes,
+    }
 
     #[derive(Error, Debug)]
     #[error("Failed to cal modular multiplicative inverse")]
@@ -224,13 +231,24 @@ mod rsa {
             blind_key: &BlindKey,
             product_number: &ProductNumber
         ) -> Result<Self, UnapplyBlindingOpsError> {
-            blind_key.0.modinv(product_number).map(Self)
-                .ok_or(UnapplyBlindingOpsError())
+            Ok(
+                Self {
+                    mask_multiplicative_inverse: blind_key.0
+                        .modinv(product_number)
+                        .ok_or(UnapplyBlindingOpsError())?,
+                    chunk_size: calc_chunk_size(product_number)
+                }
+            )
         }
 
         pub fn apply(&self, data: &[BigUint]) -> Vec<u8> {
             data.iter().fold(Vec::new(), |mut acc, chunk| {
-                acc.extend((chunk * self.0.clone()).to_bytes_le() );
+                let val = chunk * self.mask_multiplicative_inverse.clone();
+                let mut bytes = val.to_bytes_le();
+                while bytes.len() < self.chunk_size.0 {
+                    bytes.push(0);
+                }
+                acc.extend(bytes);
                 acc
             })    
         }
@@ -264,7 +282,7 @@ mod rsa {
             let receiver = KeyPair::new();
             let message = "message";
             let blind_key = {
-                BlindKey::new(sender.get_product_number()).unwrap()
+                BlindKey::new(sender.get_product_number())
             };
             let apply_blinding_ops = ApplyBlindingOps::new(&blind_key, receiver.get_product_number());
             let unapply_blinding_ops = {
@@ -288,7 +306,6 @@ mod voter {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use thiserror::Error;
     use crate::rsa;
-    use crate::rsa::BlindKeyError;
 
     pub const PACKETS_NUMBER: usize = 10;
 
@@ -349,8 +366,6 @@ mod voter {
     pub enum ProducePacketsError {
         #[error("Failed to serialize candidate_id: {0}")]
         FailedSerializedCandidateId(bincode::Error),
-        #[error(transparent)]
-        BlindKeyError(#[from] BlindKeyError),
         #[error("Failed to serialize packets_data: {0}")]
         FailedToSerializePackets(bincode::Error),
     }
@@ -384,7 +399,6 @@ mod voter {
             };
             let blind_key = {
                 rsa::BlindKey::new(self.key_pair.get_product_number())
-                    .map_err(ProducePacketsError::BlindKeyError)?
             };
             let apply_blinding_ops = rsa::ApplyBlindingOps::new(
                 &blind_key, cec_public_key.get_product_number()

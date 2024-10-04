@@ -1,18 +1,14 @@
 extern crate derive_more;
 
-use serde::{Deserialize, Serialize};
-
 mod rsa {
     use std::ops::Rem;
     use derive_more::Deref;
     use getset::Getters;
     use lazy_static::lazy_static;
     use num_bigint::{BigUint, RandBigInt};
-    use num_traits::{One, Pow, ToBytes, ToPrimitive, Zero};
+    use num_traits::{One, Zero};
     use rand::Rng;
-    use serde::{Deserialize, Serialize};
     use thiserror::Error;
-    use num_integer::Integer;
 
     const MIN_GENERATED_NUMBER: u32 = u16::MAX as u32;
     const MAX_GENERATED_NUMBER: u32 = u32::MAX;
@@ -90,9 +86,19 @@ mod rsa {
         pub static ref DEFAULT_KEY_PAIR: KeyPair = KeyPair::new();
     }
 
-    fn assert_modpow(base: &BigUint, exp: &BigUint, modulus: &BigUint) -> BigUint {
-        assert!(base < modulus, "base must be less than modulus");
-        base.modpow(exp, modulus)
+    #[derive(Error, Debug)]
+    #[error("Base {base} is bigger or equal to {modulus}")]
+    pub struct ModPowError {
+        base: BigUint,
+        modulus: BigUint,
+    }
+
+    fn modpow(base: &BigUint, exp: &BigUint, modulus: &BigUint) -> Result<BigUint, ModPowError> {
+        if base >= modulus {
+            Err(ModPowError{base: base.clone(), modulus: modulus.clone()})
+        } else {
+            Ok(base.modpow(exp, modulus))
+        }
     }
 
     impl KeyPair {
@@ -119,12 +125,6 @@ mod rsa {
         }
     }
 
-    fn quad_fold_hash(n: &ProductNumber, data: &[u8]) -> BigUint {
-        data.iter().fold(BigUint::zero(), |acc, x| {
-            assert_modpow(&(acc + BigUint::from(*x)), &TWO, &n.0)
-        })
-    }
-
     pub trait KeyRef {
         fn get_parts(&self) -> (&BigUint, &ProductNumber);
     }
@@ -141,151 +141,146 @@ mod rsa {
         }
     }
 
-    pub struct SizeInBytes(pub usize);
+    #[derive(Error, Debug)]
+    #[error(transparent)]
+    pub struct CipherDataError(#[from] ModPowError);
 
-    pub fn cipher_data(key: &impl KeyRef, data: &[u8]) -> Vec<BigUint> {
+    pub fn cipher_data_u8(key: &impl KeyRef, data: &[u8]) -> Result<Vec<BigUint>, ModPowError> {
         let (part, product_number) = key.get_parts();
-        data.iter().map(|byte| {
-            let val = BigUint::from(*byte);
-            let c = assert_modpow(&val, part, product_number);
-            c
-        })
-        .collect::<Vec<_>>()
-    }
-
-    pub fn decipher_data(key: &impl KeyRef, ciphered_data: &[BigUint]) -> Vec<u8> {
-        let (part, product_number) = key.get_parts();
-        ciphered_data.iter().fold(Vec::new(), |mut acc, crypted_byte| {
-            let val = assert_modpow(&crypted_byte, part, product_number);
-            acc.push(val.to_u8().unwrap());
-            acc
-        })
-    }
-
-
-    #[derive(Serialize, Deserialize)]
-    pub struct BlindKey(BigUint);
-
-    impl BlindKey {
-        pub fn new(product_number: &ProductNumber) -> Self {
-            loop {
-                let r = rand::thread_rng().gen_biguint_below(product_number);
-                if r.modinv(product_number).is_some() {
-                    break Self(r);
-                }
-            }
+        let mut ciphered_data = Vec::new();
+        for byte in data {
+            let ciphered_byte = modpow(&BigUint::from(*byte), part, product_number)?;
+            ciphered_data.push(ciphered_byte);
         }
+        Ok(ciphered_data)
     }
 
-    pub struct ApplyBlindingOps<'a> {
+    pub fn cipher_data_biguint(key: &impl KeyRef, data: &[BigUint]) -> Result<Vec<BigUint>, CipherDataError> {
+        let (part, product_number) = key.get_parts();
+        let mut ciphered_data = Vec::new();
+        for unit in data {
+            let ciphered_byte = modpow(&unit, part, product_number)?;
+            ciphered_data.push(ciphered_byte);
+        }
+        Ok(ciphered_data)
+    }
+
+    pub struct ApplyBlindingOps {
         mask_multiplicative: BigUint,
-        product_number: &'a ProductNumber
+        product_number: ProductNumber
     }
 
-    impl<'a> ApplyBlindingOps<'a> {
-        pub fn new(blind_key: &'a BlindKey, public_key_ref: &'a PublicKeyRef) -> Self {
-            let (e, n) = public_key_ref.get_parts();
-            let mask_multiplicative = assert_modpow(&blind_key.0, e, n);
-            Self { mask_multiplicative, product_number: n }
-        }
-    }
-
-    impl ApplyBlindingOps<'_> {
+    impl ApplyBlindingOps {
         pub fn apply(&self, data: &[u8]) -> Vec<BigUint> {
             data.iter().map(|byte| {
                 let m: BigUint = (*byte).into();
                 (m * &self.mask_multiplicative) % &self.product_number.0
             })
-            .collect::<Vec<_>>()
+                .collect::<Vec<_>>()
         }
     }
 
-    pub struct UnapplyBlindingOps<'a> {
+    pub struct UnapplyBlindingOps {
         mask_multiplicative_inverse: BigUint,
-        product_number: &'a ProductNumber
+        product_number: ProductNumber
     }
 
-    #[derive(Error, Debug)]
-    #[error("Failed to call modular multiplicative inverse")]
-    pub struct UnapplyBlindingOpsError();
-
-    impl<'a> UnapplyBlindingOps<'a> {
-        pub fn new(
-            blind_key: &'a BlindKey,
-            product_number: &'a ProductNumber
-        ) -> Result<Self, UnapplyBlindingOpsError> {
-            Ok(
-                Self {
-                    mask_multiplicative_inverse: blind_key.0
-                        .modinv(product_number)
-                        .ok_or(UnapplyBlindingOpsError())?,
-                    product_number
-                }
-            )
-        }
-    }
-
-    impl UnapplyBlindingOps<'_> {
-        pub fn apply(&self, data: &[BigUint]) -> Vec<u8> {
+    impl UnapplyBlindingOps {
+        pub fn apply(&self, data: &[BigUint]) -> Vec<BigUint> {
             data.iter().fold(Vec::new(), |mut acc, blinded_byte| {
                 let val = (blinded_byte * &self.mask_multiplicative_inverse)
                     % (&self.product_number.0);
-                acc.push(val.to_u8().unwrap());
+                acc.push(val);
                 acc
             })
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::{
-            cipher_data, decipher_data, ApplyBlindingOps,
-            BlindKey, KeyPair, UnapplyBlindingOps
+    pub fn create_blinding_ops(public_key_ref: &PublicKeyRef) -> (ApplyBlindingOps, UnapplyBlindingOps) {
+        let (r, r_inv) = loop {
+            let r = rand::thread_rng().gen_biguint_below(public_key_ref.product_number);
+            if let Some(r_inv) = r.modinv(public_key_ref.product_number) {
+                break (r, r_inv);
+            }
         };
 
+        let (e, n) = public_key_ref.get_parts();
+        let mask_multiplicative = modpow(&r, e, n).unwrap();
+
+        (
+            ApplyBlindingOps { mask_multiplicative, product_number: n.clone() },
+            UnapplyBlindingOps { mask_multiplicative_inverse: r_inv, product_number: n.clone() }
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use num_traits::ToPrimitive;
+        use super::{cipher_data_biguint, cipher_data_u8, create_blinding_ops, CipherDataError, KeyPair};
+
         #[test]
-        fn test_blinding() {
-            let sender = KeyPair::new();
-
-            let message = "m";
-            let blind_key = BlindKey::new(sender.get_product_number());
-
-            let public_key_ref = sender.get_public_key_ref();
-            let apply_blinding_ops = ApplyBlindingOps::new(&blind_key, &public_key_ref);
-            let blinded_data = apply_blinding_ops.apply(message.as_bytes());
-
+        fn test_blinding() -> Result<(), CipherDataError> {
             let receiver = KeyPair::new();
 
-            let ser_blinded_data = bincode::serialize(&blinded_data).unwrap();
-            let signed_ser_blinded_data = cipher_data(&receiver.get_private_key_ref(), &ser_blinded_data);
+            let message = "message yopta";
 
-            let unapply_blinding_ops = UnapplyBlindingOps::new(
-                &blind_key, receiver.get_product_number()
-            ).unwrap();
-            let unblinded_signed_data = unapply_blinding_ops.apply(&blinded_data)
+            let (apply_ops, unapply_ops) = {
+                create_blinding_ops(&receiver.get_public_key_ref())
+            };
 
+            let original_data = {
+                let unblinded_signed_data = {
+                    let signed_blinded_data = {
+                        let unciphered_blinded_data = {
 
+                            let ciphered_blinded_data = {
+                                let blinded_data = apply_ops.apply(message.as_bytes());
 
+                                cipher_data_biguint(
+                                    &receiver.get_public_key_ref(), &blinded_data
+                                )?
+                            };
 
+                            cipher_data_biguint(
+                                &receiver.get_private_key_ref(), &ciphered_blinded_data
+                            )?
+                        };
 
+                        cipher_data_biguint(
+                            &receiver.get_private_key_ref(), &unciphered_blinded_data
+                        )?
+                    };
 
-            let unblinded_data = ;
-            let unblined_message = String::from_utf8(unblinded_data).unwrap();
+                    unapply_ops.apply(&signed_blinded_data)
+                };
 
-            assert_eq!(unblined_message, message);
-            println!("{}", unblined_message);
+                cipher_data_biguint(
+                    &receiver.get_public_key_ref(), &unblinded_signed_data
+                )?
+            };
+
+            let original_bytes = original_data.into_iter()
+                .map(|e| {
+                    e.to_u8().unwrap()
+                }).collect::<Vec<_>>();
+
+            let original_message = String::from_utf8(original_bytes).unwrap();
+
+            assert_eq!(original_message, message);
+            println!("{}", original_message);
+            Ok(())
         }
 
         #[test]
         fn test_ciphering() {
             let r = KeyPair::new();
             let message = "message";
-            let ciphered_data = cipher_data(
+            let ciphered_data = cipher_data_u8(
                 &r.get_public_key_ref(), message.as_bytes()
-            );
-            let deciphered_data = decipher_data(
+            ).unwrap();
+            let deciphered_data = cipher_data_biguint(
                 &r.get_private_key_ref(), &ciphered_data
-            );
+            ).unwrap().into_iter().map(|e| e.to_u8().unwrap()).collect();
             let deciphered_message = String::from_utf8(deciphered_data).unwrap();
             assert_eq!(deciphered_message, message);
             println!("{}", deciphered_message);

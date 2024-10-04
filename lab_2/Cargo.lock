@@ -81,6 +81,7 @@ dependencies = [
  "getset",
  "lazy_static",
  "num-bigint",
+ "num-integer",
  "num-traits",
  "rand",
  "serde",

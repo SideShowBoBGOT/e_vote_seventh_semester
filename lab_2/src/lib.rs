@@ -731,79 +731,79 @@ mod cec {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use std::collections::HashMap;
-//     use std::num::NonZeroUsize;
-//     use rand::seq::IteratorRandom;
-//     use crate::{cec, voter};
-//
-//     #[test]
-//     fn test_vote() {
-//         let mut voters = (0..10).into_iter().map(|_| voter::Voter::new())
-//             .collect::<Vec<_>>();
-//
-//         let mut cec = cec::CEC::new(
-//             (0..10).into_iter().map(|i| format!("Candidate {}", i)),
-//             HashMap::from_iter(voters.iter().map(|v| (
-//                 v.get_id().clone(), cec::VoterState::CanVote(cec::CanVoteState::NotRegistered)))
-//             )
-//         );
-//
-//         let mut rng = rand::thread_rng();
-//
-//         for voter in &mut voters {
-//             let packet = voter.produce_packets(
-//                 NonZeroUsize::new(10).unwrap(), cec.get_candidates().keys(), &cec.get_public_key()
-//             ).unwrap();
-//             let signed_candidate_id_vec = cec.consume_packets(&packet).unwrap();
-//
-//         }
-//
-//         for el in cec.get_candidates() {
-//             println!("{:?}", el);
-//         }
-//     }
-//
-//     // #[test]
-//     // fn test_can_not_vote() {
-//     //     let mut voter = voter::Voter::new();
-//     //
-//     //     let mut cec = cec::CEC::new(
-//     //         (0..10).into_iter().map(|i| format!("Candidate {}", i)),
-//     //         HashMap::from([
-//     //             (voter.get_public_key(), cec::VoterState::CanNotVote)
-//     //         ])
-//     //     );
-//     //
-//     //     let vote_data = voter.vote(
-//     //         cec.get_candidates().keys().last().unwrap(),
-//     //         &cec.get_public_key()
-//     //     );
-//     //
-//     //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
-//     //     assert_eq!(err, cec::VoteError::VoterCanNotVote);
-//     // }
-//     //
-//     // #[test]
-//     // fn test_already_voted() {
-//     //     let mut voter = voter::Voter::new();
-//     //
-//     //     let mut cec = cec::CEC::new(
-//     //         (0..10).into_iter().map(|i| format!("Candidate {}", i)),
-//     //         HashMap::from([
-//     //             (voter.get_public_key(), cec::VoterState::CanVote)
-//     //         ])
-//     //     );
-//     //
-//     //     let vote_data = voter.vote(
-//     //         cec.get_candidates().keys().last().unwrap(),
-//     //         &cec.get_public_key()
-//     //     );
-//     //
-//     //     cec.process_vote(&voter.get_public_key(), vote_data.clone()).unwrap();
-//     //
-//     //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
-//     //     assert_eq!(err, cec::VoteError::VoterAlreadyVoted);
-//     // }
-// }
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroUsize;
+    use rand::seq::IteratorRandom;
+    use crate::{cec, voter};
+
+    #[test]
+    fn test_vote() {
+        let mut voters = (0..10).into_iter().map(|_| voter::Voter::new())
+            .collect::<Vec<_>>();
+
+        let mut cec = cec::CEC::new(
+            (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+            HashMap::from_iter(voters.iter().map(|v| (
+                v.get_id().clone(), cec::VoterState::CanVote(cec::CanVoteState::NotRegistered)))
+            )
+        );
+
+        let mut rng = rand::thread_rng();
+
+        for voter in &mut voters {
+            let packet = voter.produce_packets(
+                NonZeroUsize::new(10).unwrap(), cec.get_candidates().keys(), &cec.get_public_key()
+            ).unwrap();
+            let signed_candidate_id_vec = cec.consume_packets(&packet).unwrap();
+
+        }
+
+        for el in cec.get_candidates() {
+            println!("{:?}", el);
+        }
+    }
+
+    // #[test]
+    // fn test_can_not_vote() {
+    //     let mut voter = voter::Voter::new();
+    //
+    //     let mut cec = cec::CEC::new(
+    //         (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+    //         HashMap::from([
+    //             (voter.get_public_key(), cec::VoterState::CanNotVote)
+    //         ])
+    //     );
+    //
+    //     let vote_data = voter.vote(
+    //         cec.get_candidates().keys().last().unwrap(),
+    //         &cec.get_public_key()
+    //     );
+    //
+    //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
+    //     assert_eq!(err, cec::VoteError::VoterCanNotVote);
+    // }
+    //
+    // #[test]
+    // fn test_already_voted() {
+    //     let mut voter = voter::Voter::new();
+    //
+    //     let mut cec = cec::CEC::new(
+    //         (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+    //         HashMap::from([
+    //             (voter.get_public_key(), cec::VoterState::CanVote)
+    //         ])
+    //     );
+    //
+    //     let vote_data = voter.vote(
+    //         cec.get_candidates().keys().last().unwrap(),
+    //         &cec.get_public_key()
+    //     );
+    //
+    //     cec.process_vote(&voter.get_public_key(), vote_data.clone()).unwrap();
+    //
+    //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
+    //     assert_eq!(err, cec::VoteError::VoterAlreadyVoted);
+    // }
+}

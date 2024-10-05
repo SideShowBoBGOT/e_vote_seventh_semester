@@ -308,11 +308,10 @@ mod voter {
 
     pub const PACKETS_NUMBER: usize = 10;
 
-    #[derive(Getters, Serialize, Deserialize)]
-    #[getset(get = "pub with_prefix")]
+    #[derive(Serialize, Deserialize)]
     pub(crate) struct PacketsData {
-        blinded_candidate_id_vec_vec: Vec<BlindedCandidateIdVec>,
-        unapply_blind_ops: rsa::UnapplyBlindingOps,
+        pub blinded_candidate_id_vec_vec: Vec<BlindedCandidateIdVec>,
+        pub unapply_blind_ops: rsa::UnapplyBlindingOps,
     }
 
     #[derive(Getters, Clone)]
@@ -440,16 +439,14 @@ mod voter {
 
 mod cec {
     use std::collections::HashMap;
-    use getset::Getters;
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use thiserror::Error;
     use crate::{rsa, voter};
-    use crate::voter::{CandidateId, CandidateIdVec, VoterId};
 
     pub struct CEC {
         candidates: HashMap<String, u64>,
-        voters_state: HashMap<VoterId, VoterState>,
+        voters_state: HashMap<voter::VoterId, VoterState>,
         key_pair: rsa::KeyPair,
     }
 
@@ -492,8 +489,9 @@ mod cec {
         FailedConvertToByteData(BigUint),
         #[error("Failed to deserialize packets_data: {0}")]
         FailedToDeserializePackets(bincode::Error),
-        #[error(transparent)]
-        FailedCreateUnapplyBlindingOps(#[from] rsa::UnapplyBlindingOpsError),
+        #[error("Failed to sign candidate_id_vec: {0}")]
+        FailedSignCandidateIdVec(rsa::CipherDataError),
+
         #[error("Failed to deserialize candidate_id: {0}")]
         FailedDeserializedCandidateId(bincode::Error),
         #[error(transparent)]
@@ -509,20 +507,20 @@ mod cec {
         #[error("Invalid candidate: {0}")]
         InvalidCandidateError(String),
         #[error("Invalid voter id: {0:?}")]
-        InvalidVoterId(VoterId),
+        InvalidVoterId(voter::VoterId),
         #[error("Invalid voter state: {0:?}")]
         InvalidVoterState(VoterState),
         #[error("Ids are not the same: {0:?} != {1:?}")]
-        IdsAreNotTheSame(VoterId, VoterId),
+        IdsAreNotTheSame(voter::VoterId, voter::VoterId),
         #[error("Real: {0}, packet: {1}")]
         CandidatesListLenNotMatch(usize, usize)
     }
 
     fn check_packet<'a>(
-        candidate_id_vec_vec: &'a [CandidateIdVec],
+        candidate_id_vec_vec: &'a [voter::CandidateIdVec],
         candidates: &'a HashMap<String, u64>,
-        voters_state: &'a HashMap<VoterId, VoterState>,
-    ) -> Result<VoterId, CheckCandidateIdError> {
+        voters_state: &'a HashMap<voter::VoterId, VoterState>,
+    ) -> Result<voter::VoterId, CheckCandidateIdError> {
         for candidate_id_vec in candidate_id_vec_vec.iter() {
             if candidate_id_vec.0.len() != candidates.len() {
                 return Err(
@@ -569,7 +567,7 @@ mod cec {
     impl CEC {
         pub fn new(
             candidates: impl Iterator<Item=String>,
-            voters_state: HashMap<VoterId, VoterState>
+            voters_state: HashMap<voter::VoterId, VoterState>
         ) -> Self {
             Self {
                 candidates: HashMap::from_iter(
@@ -583,53 +581,72 @@ mod cec {
         pub fn consume_packets(
             &mut self,
             ciphered_data: &[BigUint]
-        ) -> Result<Vec<BigUint>, ConsumePacketsError> {
-            let packet_data: voter::PacketsData = {
-                let deciphered_byte_data = {
-                    let deciphered_data = rsa::cipher_data(
-                        &self.key_pair.get_private_key_ref(), ciphered_data
-                    ).map_err(|err| ConsumePacketsError::FailedToDecipherPacket(err))?;
+        ) -> Result<(), ConsumePacketsError> {
+            let (unapply_blind_ops, signed_candidate_id_vec_vec) = {
+                let packet_data: voter::PacketsData = {
+                    let deciphered_byte_data = {
+                        let deciphered_data = rsa::cipher_data(
+                            &self.key_pair.get_private_key_ref(), ciphered_data
+                        ).map_err(|err| ConsumePacketsError::FailedToDecipherPacket(err))?;
 
-                    let mut deciphered_byte_data = Vec::with_capacity(deciphered_data.len());
-                    for unit in &deciphered_data {
-                        let byte = unit.to_u8().ok_or_else(|| {
-                            ConsumePacketsError::FailedConvertToByteData(unit.clone())
-                        })?;
-                        deciphered_byte_data.push(byte);
-                    }
-                    deciphered_byte_data
+                        let mut deciphered_byte_data = Vec::with_capacity(deciphered_data.len());
+                        for unit in &deciphered_data {
+                            let byte = unit.to_u8().ok_or_else(|| {
+                                ConsumePacketsError::FailedConvertToByteData(unit.clone())
+                            })?;
+                            deciphered_byte_data.push(byte);
+                        }
+                        deciphered_byte_data
+                    };
+                    bincode::deserialize(&deciphered_byte_data)
+                        .map_err(ConsumePacketsError::FailedToDeserializePackets)?
                 };
-                bincode::deserialize(&deciphered_byte_data)
-                    .map_err(ConsumePacketsError::FailedToDeserializePackets)?
+                (
+                    packet_data.unapply_blind_ops,
+                    packet_data.blinded_candidate_id_vec_vec
+                        .into_iter()
+                        .try_fold(
+                            Vec::new(),
+                            |mut acc, candidate_id_vec| {
+                                acc.extend(
+                                    rsa::cipher_data(
+                                        &self.key_pair.get_private_key_ref(),
+                                        &candidate_id_vec.0
+                                    )?
+                                );
+                                Ok(acc)
+                            }
+                        )
+                        .map_err(ConsumePacketsError::FailedSignCandidateIdVec)?
+                )
             };
-            if packet_data.get_blinded_candidate_id_vec_vec().is_empty() {
-                return Err(ConsumePacketsError::PacketDataTooLittle(
-                    packet_data.get_blinded_candidate_id_vec_vec().len()
-                ));
-            }
-            let candidate_id_vec_vec = {
-                let unapply_blinding_ops = rsa::UnapplyBlindingOps::new(
-                    packet_data.get_blind_key(),
-                    self.key_pair.get_product_number()
-                )?;
-                let mut candidate_id_vec_vec = Vec::<voter::CandidateIdVec>::new();
-                for blinded_candidate_id_vec in packet_data
-                    .get_blinded_candidate_id_vec_vec().iter().skip(1) {
-                    let blinded_candidate_id = unapply_blinding_ops.apply(
-                        &self.key_pair.get_private_key_ref(),
-                        &blinded_candidate_id_vec.0
-                    );
-                    candidate_id_vec_vec.push(bincode::deserialize(&blinded_candidate_id)
-                        .map_err(ConsumePacketsError::FailedDeserializedCandidateId)?);
-                }
-                candidate_id_vec_vec
-            };
-            let voter_id = check_packet(&candidate_id_vec_vec, &self.candidates, &self.voters_state)
-                .map_err(Into::<ConsumePacketsError>::into)?;
-            let packet = bincode::serialize(packet_data.get_blinded_candidate_id_vec_vec().first().unwrap())
-                .map_err(ConsumePacketsError::FailedSerializeOutputCandidateIdVec)?;
-            *self.voters_state.get_mut(&voter_id).unwrap() = VoterState::CanVote(CanVoteState::Registered);
-            Ok(rsa::cipher_data(&self.key_pair.get_private_key_ref(), &packet))
+
+
+            Ok(())
+            // if packet_data.get_blinded_candidate_id_vec_vec().is_empty() {
+            //     return Err(ConsumePacketsError::PacketDataTooLittle(
+            //         packet_data.get_blinded_candidate_id_vec_vec().len()
+            //     ));
+            // }
+            // let candidate_id_vec_vec = {
+            //     let mut candidate_id_vec_vec = Vec::<voter::CandidateIdVec>::new();
+            //     for blinded_candidate_id_vec in packet_data
+            //         .get_blinded_candidate_id_vec_vec().iter().skip(1) {
+            //         let blinded_candidate_id = unapply_blinding_ops.apply(
+            //             &self.key_pair.get_private_key_ref(),
+            //             &blinded_candidate_id_vec.0
+            //         );
+            //         candidate_id_vec_vec.push(bincode::deserialize(&blinded_candidate_id)
+            //             .map_err(ConsumePacketsError::FailedDeserializedCandidateId)?);
+            //     }
+            //     candidate_id_vec_vec
+            // };
+            // let voter_id = check_packet(&candidate_id_vec_vec, &self.candidates, &self.voters_state)
+            //     .map_err(Into::<ConsumePacketsError>::into)?;
+            // let packet = bincode::serialize(packet_data.get_blinded_candidate_id_vec_vec().first().unwrap())
+            //     .map_err(ConsumePacketsError::FailedSerializeOutputCandidateIdVec)?;
+            // *self.voters_state.get_mut(&voter_id).unwrap() = VoterState::CanVote(CanVoteState::Registered);
+            // Ok(rsa::cipher_data(&self.key_pair.get_private_key_ref(), &packet))
         }
 
         // pub fn process_vote(&mut self, voter_key: &rsa::PublicKey, vote_data: voter::VoteData)

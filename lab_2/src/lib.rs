@@ -23,7 +23,7 @@ mod rsa {
     use derive_more::Deref;
     use getset::Getters;
     use lazy_static::lazy_static;
-    use num_bigint::{BigUint, RandBigInt, ToBigUint};
+    use num_bigint::{BigUint, RandBigInt};
     use num_traits::{One, Zero};
     use rand::Rng;
     use serde::{Deserialize, Serialize};
@@ -325,7 +325,7 @@ mod voter {
     #[derive(Default, Getters)]
     #[getset(get = "pub with_prefix")]
     pub struct Voter {
-        key_pair: rsa::KeyPair,
+        // key_pair: rsa::KeyPair,
         id: VoterId
     }
 
@@ -357,11 +357,11 @@ mod voter {
     #[derive(Error, Debug)]
     pub enum ProducePacketsError {
         #[error("Failed to serialize candidate_id: {0}")]
-        FailedSerializedCandidateId(bincode::Error),
+        SerializedCandidateId(bincode::Error),
         #[error("Failed to serialize packets_data: {0}")]
-        FailedToSerializePackets(bincode::Error),
+        SerializePackets(bincode::Error),
         #[error("Failed to cipher packets_data: {0}")]
-        FailedCipherPacketsData(#[from] CipherDataError),
+        CipherPacketsData(#[from] CipherDataError),
     }
 
     #[derive(Error, Debug, From)]
@@ -387,7 +387,7 @@ mod voter {
     impl Voter {
         pub fn new() -> Self {
             Self {
-                key_pair: rsa::KeyPair::new(),
+                // key_pair: rsa::KeyPair::new(),
                 id: VoterId(rsa::generate_num())
             }
         }
@@ -405,7 +405,7 @@ mod voter {
                     ).collect::<Vec<_>>()
                 );
                 bincode::serialize(&candidate_id_pairs)
-                    .map_err(ProducePacketsError::FailedSerializedCandidateId)
+                    .map_err(ProducePacketsError::SerializedCandidateId)
                     .map(|serialized_candidate_ids| vec![
                         SerializedCandidateIdVec(serialized_candidate_ids);
                         candidate_id_vec_number.get()
@@ -421,7 +421,7 @@ mod voter {
             };
             let packets_data = PacketsData{ blinded_candidate_id_vec_vec, unapply_blind_ops };
             let serialized_packet = bincode::serialize(&packets_data)
-                .map_err(|err| ProducePacketsError::FailedToSerializePackets(err))?;
+                .map_err(ProducePacketsError::SerializePackets)?;
             rsa::cipher_data_u8(cec_public_key, &serialized_packet).map_err(Into::into)
         }
 
@@ -463,13 +463,12 @@ mod cec {
     use derive_more::From;
     use num_bigint::BigUint;
     use num_integer::Integer;
-    use num_traits::ToPrimitive;
     use thiserror::Error;
     use crate::{convert_to_bytes, rsa, voter};
     use crate::rsa::{CipherDataError, UnapplyBlindingOps};
     use crate::voter::VoterId;
 
-    pub struct CEC {
+    pub struct Cec {
         candidates: HashMap<String, u64>,
         voters_state: HashMap<voter::VoterId, VoterState>,
         key_pair: rsa::KeyPair,
@@ -541,7 +540,7 @@ mod cec {
     }
 
     #[derive(Error, Debug)]
-    enum CheckCandidateIdError {
+    pub enum CheckCandidateIdError {
         #[error("Invalid candidate: {0}")]
         InvalidCandidateError(String),
         #[error("Invalid voter id: {0:?}")]
@@ -602,7 +601,7 @@ mod cec {
         Ok(first.get_id().clone())
     }
 
-    impl CEC {
+    impl Cec {
         pub fn new(
             candidates: impl Iterator<Item=String>,
             voters_state: HashMap<voter::VoterId, VoterState>
@@ -713,10 +712,9 @@ mod cec {
                             } else {
                                 self.candidates.get_mut(candidate_id.get_candidate())
                                     .ok_or_else(|| VoteError::InvalidCandidate(candidate_id.get_candidate().clone()))
-                                    .and_then(|votes_number| {
+                                    .map(|votes_number| {
                                         votes_number.inc();
                                         *voter_state = VoterState::CanVote(CanVoteState::Voted);
-                                        Ok(())
                                     })
                             }
                         })
@@ -744,7 +742,7 @@ mod tests {
         let mut voters = (0..10).into_iter().map(|_| voter::Voter::new())
             .collect::<Vec<_>>();
 
-        let mut cec = cec::CEC::new(
+        let mut cec = cec::Cec::new(
             (0..10).into_iter().map(|i| format!("Candidate {}", i)),
             HashMap::from_iter(voters.iter().map(|v| (
                 v.get_id().clone(), cec::VoterState::CanVote(cec::CanVoteState::NotRegistered)))

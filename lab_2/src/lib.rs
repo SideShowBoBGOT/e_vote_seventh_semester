@@ -1,7 +1,24 @@
 extern crate derive_more;
 
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
+
+pub fn convert_to_bytes<E>(i: Vec<BigUint>) -> Result<Vec<u8>, E>
+where
+    E: From<BigUint>
+{
+    i.into_iter()
+        .try_fold(Vec::new(), |mut acc, unit| {
+            unit.to_u8().ok_or_else(|| {
+                E::from(unit.clone())
+            }).map(|byte| {
+                acc.push(byte);
+                acc
+            })
+        })
+}
+
 mod rsa {
-    use std::borrow::Cow;
     use std::ops::Rem;
     use derive_more::Deref;
     use getset::Getters;
@@ -284,12 +301,14 @@ mod rsa {
 
 mod voter {
     use std::num::NonZeroUsize;
+    use derive_more::From;
     use getset::Getters;
     use num_bigint::BigUint;
+    use rand::prelude::SliceRandom;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
-    use crate::rsa;
-    use crate::rsa::CipherDataError;
+    use crate::{convert_to_bytes, rsa};
+    use crate::rsa::{cipher_data_biguint, cipher_data_u8, CipherDataError, UnapplyBlindingOps};
 
     #[derive(Serialize, Deserialize)]
     pub(crate) struct PacketsData {
@@ -324,7 +343,7 @@ mod voter {
         id: &'a VoterId
     }
 
-    #[derive(Deserialize, Getters, Default, Clone)]
+    #[derive(Serialize, Deserialize, Getters, Default, Clone)]
     #[getset(get = "pub with_prefix")]
     pub struct CandidateId {
         candidate: String,
@@ -351,6 +370,19 @@ mod voter {
         FailedToSerializePackets(bincode::Error),
         #[error("Failed to cipher packets_data: {0}")]
         FailedCipherPacketsData(#[from] CipherDataError),
+    }
+
+    #[derive(Error, Debug, From)]
+    pub struct UncipherConvertToBytesError(BigUint);
+
+    #[derive(Error, Debug)]
+    pub enum VoteError {
+        FailedUncipherVote(#[from] CipherDataError),
+        FailedUncipherConvertToBytes(#[from] UncipherConvertToBytesError),
+        FailedDeserializeCandidateIdVec(bincode::Error),
+        CandidateIdVecIsEmpty,
+        FailedSerializeCandidateId(bincode::Error),
+        FailedCipherCandidateId(CipherDataError)
     }
 
     impl Voter {
@@ -396,10 +428,33 @@ mod voter {
 
         pub fn accept_signed_packet_and_vote(
             &self,
-            signed_blinded_vote: &[BigUint],
+            signed_blinded_vote: Vec<BigUint>,
+            unapply_blinding_ops: UnapplyBlindingOps,
             cec_public_key: &rsa::PublicKeyRef
-        ) {
-
+        ) -> Result<Vec<BigUint>, VoteError> {
+            let signed_vote = unapply_blinding_ops.apply(signed_blinded_vote);
+            cipher_data_biguint(&cec_public_key, signed_vote)
+                .map_err(VoteError::FailedUncipherVote)
+                .and_then(|data|
+                    convert_to_bytes::<UncipherConvertToBytesError>(data)
+                        .map_err(VoteError::into)
+                )
+                .and_then(|byte_data|
+                    bincode::deserialize::<CandidateIdVec>(&byte_data)
+                        .map_err(VoteError::FailedDeserializeCandidateIdVec)
+                )
+                .and_then(|candidate_id_vec| {
+                    candidate_id_vec.0.choose(&mut rand::thread_rng())
+                        .ok_or(VoteError::CandidateIdVecIsEmpty)
+                        .and_then(|candidate_id| {
+                            bincode::serialize(&candidate_id)
+                                .map_err(VoteError::FailedSerializeCandidateId)
+                        })
+                })
+                .and_then(|serialized_candidate_id| {
+                    cipher_data_u8(cec_public_key, &serialized_candidate_id)
+                        .map_err(VoteError::FailedCipherCandidateId)
+                })
         }
 
         // pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
@@ -426,7 +481,8 @@ mod cec {
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use thiserror::Error;
-    use crate::{rsa, voter};
+    use crate::{convert_to_bytes, rsa, voter};
+    use crate::rsa::UnapplyBlindingOps;
 
     pub struct CEC {
         candidates: HashMap<String, u64>,
@@ -559,21 +615,6 @@ mod cec {
         Ok(first.get_id().clone())
     }
 
-    fn convert_to_bytes<E>(i: Vec<BigUint>) -> Result<Vec<u8>, E>
-        where
-            E: From<BigUint>
-    {
-        i.into_iter()
-            .try_fold(Vec::new(), |mut acc, unit| {
-                unit.to_u8().ok_or_else(|| {
-                    E::from(unit.clone())
-                }).map(|byte| {
-                    acc.push(byte);
-                    acc
-                })
-            })
-    }
-
     impl CEC {
         pub fn new(
             candidates: impl Iterator<Item=String>,
@@ -591,7 +632,7 @@ mod cec {
         pub fn consume_packets(
             &mut self,
             ciphered_data: Vec<BigUint>
-        ) -> Result<Vec<BigUint>, ConsumePacketsError> {
+        ) -> Result<(Vec<BigUint>, UnapplyBlindingOps), ConsumePacketsError> {
             let (unapply_blind_ops, mut signed_blinded_candidate_id_vec_vec) = {
                 let packet_data: voter::PacketsData = {
                     let deciphered_byte_data = {
@@ -661,7 +702,7 @@ mod cec {
                 };
                 let voter_id = check_packet(&check_candidate_id_vec_vec, &self.candidates, &self.voters_state)?;
                 *self.voters_state.get_mut(&voter_id).unwrap() = VoterState::CanVote(CanVoteState::Registered);
-                Ok(last)
+                Ok((last, unapply_blind_ops))
             }
         }
 

@@ -612,55 +612,53 @@ mod cec {
         pub fn consume_packets(
             &mut self,
             ciphered_data: &[BigUint]
-        ) -> Result<(), ConsumePacketsError> {
-            let unblinded_signed_candidate_id_vec_vec = {
-                let (unapply_blind_ops, signed_blinded_candidate_id_vec_vec) = {
-                    let packet_data: voter::PacketsData = {
-                        let deciphered_byte_data = {
-                            let deciphered_data = rsa::cipher_data(
-                                &self.key_pair.get_private_key_ref(), ciphered_data
-                            ).map_err(|err| {
-                                ConsumePacketsError::FailedToDecipherPacket(err)
-                            })?;
-                            convert_to_bytes::<ConvertToByteDataError>(deciphered_data)?
-                        };
-                        bincode::deserialize(&deciphered_byte_data)
-                            .map_err(ConsumePacketsError::FailedToDeserializePackets)?
+        ) -> Result<Vec<BigUint>, ConsumePacketsError> {
+            let (unapply_blind_ops, mut signed_blinded_candidate_id_vec_vec) = {
+                let packet_data: voter::PacketsData = {
+                    let deciphered_byte_data = {
+                        let deciphered_data = rsa::cipher_data(
+                            &self.key_pair.get_private_key_ref(), ciphered_data
+                        ).map_err(|err| {
+                            ConsumePacketsError::FailedToDecipherPacket(err)
+                        })?;
+                        convert_to_bytes::<ConvertToByteDataError>(deciphered_data)?
                     };
-                    (
-                        packet_data.unapply_blind_ops,
-                        packet_data.blinded_candidate_id_vec_vec
-                            .into_iter()
-                            .try_fold(
-                                Vec::new(),
-                                |mut acc, candidate_id_vec| {
-                                    acc.push(
-                                        rsa::cipher_data(
-                                            &self.key_pair.get_private_key_ref(),
-                                            &candidate_id_vec.0
-                                        )?
-                                    );
-                                    Ok(acc)
-                                }
-                            )
-                            .map_err(ConsumePacketsError::FailedSignCandidateIdVec)?
-                    )
+                    bincode::deserialize(&deciphered_byte_data)
+                        .map_err(ConsumePacketsError::FailedToDeserializePackets)?
                 };
-                signed_blinded_candidate_id_vec_vec
-                    .into_iter()
-                    .map(
-                        |candidate_id_vec| {
-                            unapply_blind_ops.apply(&candidate_id_vec)
-                        }
-                    )
-                    .collect::<Vec<_>>()
+                (
+                    packet_data.unapply_blind_ops,
+                    packet_data.blinded_candidate_id_vec_vec
+                        .into_iter()
+                        .try_fold(
+                            Vec::new(),
+                            |mut acc, candidate_id_vec| {
+                                acc.push(
+                                    rsa::cipher_data(
+                                        &self.key_pair.get_private_key_ref(),
+                                        &candidate_id_vec.0
+                                    )?
+                                );
+                                Ok(acc)
+                            }
+                        )
+                        .map_err(ConsumePacketsError::FailedSignCandidateIdVec)?
+                )
             };
 
-            if unblinded_signed_candidate_id_vec_vec.is_empty() {
+            if signed_blinded_candidate_id_vec_vec.is_empty() {
                 Err(ConsumePacketsError::PacketDataIsEmpty)
             } else {
+                let last = signed_blinded_candidate_id_vec_vec.pop().unwrap();
+                let unblinded_signed_candidate_id_vec_vec = signed_blinded_candidate_id_vec_vec
+                    .into_iter()
+                    .map(
+                        |candidate_id_vec|
+                            unapply_blind_ops.apply(&candidate_id_vec)
+                    )
+                    .collect::<Vec<_>>();
                 let check_candidate_id_vec_vec = {
-                    unblinded_signed_candidate_id_vec_vec.iter().skip(1)
+                    unblinded_signed_candidate_id_vec_vec.iter()
                         .try_fold(
                             Vec::new(),
                             |mut acc, signed_candidate_id_vec| {
@@ -683,13 +681,9 @@ mod cec {
                             }
                         )?
                 };
-
-
-                // let packet = bincode::serialize(packet_data.get_blinded_candidate_id_vec_vec().first().unwrap())
-                //     .map_err(ConsumePacketsError::FailedSerializeOutputCandidateIdVec)?;
-                // *self.voters_state.get_mut(&voter_id).unwrap() = VoterState::CanVote(CanVoteState::Registered);
-                // Ok(rsa::cipher_data(&self.key_pair.get_private_key_ref(), &packet))
-                Ok(())
+                let voter_id = check_packet(&check_candidate_id_vec_vec, &self.candidates, &self.voters_state)?;
+                *self.voters_state.get_mut(&voter_id).unwrap() = VoterState::CanVote(CanVoteState::Registered);
+                Ok(last)
             }
         }
 

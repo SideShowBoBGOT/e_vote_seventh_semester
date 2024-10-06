@@ -308,7 +308,6 @@ mod voter {
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use crate::{convert_to_bytes, rsa};
-    use crate::rsa::{cipher_data_biguint, cipher_data_u8, CipherDataError, UnapplyBlindingOps};
 
     #[derive(Serialize, Deserialize)]
     pub(crate) struct PacketsData {
@@ -361,7 +360,7 @@ mod voter {
         #[error("Failed to serialize packets_data: {0}")]
         SerializePackets(bincode::Error),
         #[error("Failed to cipher packets_data: {0}")]
-        CipherPacketsData(#[from] CipherDataError),
+        CipherPacketsData(#[from] rsa::CipherDataError),
     }
 
     #[derive(Error, Debug, From)]
@@ -371,7 +370,7 @@ mod voter {
     #[derive(Error, Debug)]
     pub enum VoteError {
         #[error("Failed to uncipher vote: {0}")]
-        FailedUncipherVote(#[from] CipherDataError),
+        FailedUncipherVote(#[from] rsa::CipherDataError),
         #[error(transparent)]
         FailedUncipheredConvertToBytes(#[from] UncipheredConvertToBytesError),
         #[error("Failed to deserialize candidate id vec: {0}")]
@@ -381,7 +380,7 @@ mod voter {
         #[error("Failed serialize candidate id")]
         FailedSerializeCandidateId(bincode::Error),
         #[error("Failed serialize candidate id")]
-        FailedCipherCandidateId(CipherDataError)
+        FailedCipherCandidateId(rsa::CipherDataError)
     }
 
     impl Voter {
@@ -428,11 +427,11 @@ mod voter {
         pub fn accept_signed_packet_and_vote(
             &self,
             signed_blinded_vote: Vec<BigUint>,
-            unapply_blinding_ops: UnapplyBlindingOps,
+            unapply_blinding_ops: rsa::UnapplyBlindingOps,
             cec_public_key: &rsa::PublicKeyRef
         ) -> Result<Vec<BigUint>, VoteError> {
             let signed_vote = unapply_blinding_ops.apply(signed_blinded_vote);
-            cipher_data_biguint(cec_public_key, signed_vote)
+            rsa::cipher_data_biguint(cec_public_key, signed_vote)
                 .map_err(VoteError::FailedUncipherVote)
                 .and_then(|data|
                     convert_to_bytes::<UncipheredConvertToBytesError>(&data)
@@ -451,7 +450,7 @@ mod voter {
                         })
                 })
                 .and_then(|serialized_candidate_id| {
-                    cipher_data_u8(cec_public_key, &serialized_candidate_id)
+                    rsa::cipher_data_u8(cec_public_key, &serialized_candidate_id)
                         .map_err(VoteError::FailedCipherCandidateId)
                 })
         }
@@ -465,8 +464,6 @@ mod cec {
     use num_integer::Integer;
     use thiserror::Error;
     use crate::{convert_to_bytes, rsa, voter};
-    use crate::rsa::{CipherDataError, UnapplyBlindingOps};
-    use crate::voter::VoterId;
 
     pub struct Cec {
         candidates: HashMap<String, u64>,
@@ -481,13 +478,13 @@ mod cec {
     #[derive(Error, Debug)]
     pub enum VoteError {
         #[error("Failed to decipher vote: {0}")]
-        FailedDecipherVote(CipherDataError),
+        FailedDecipherVote(rsa::CipherDataError),
         #[error(transparent)]
         ConvertUncipheredToBytes(#[from] ConvertUncipheredToBytesError),
         #[error("Failed to deserialize candidate id vec: {0}")]
         FailedToDeserializeCandidateId(#[from] bincode::Error),
         #[error("Voter id is absent: {0:?}")]
-        VoterIdAbsent(VoterId),
+        VoterIdAbsent(voter::VoterId),
         #[error("Voter has invalid state: {0:?}")]
         VoterInvalidState(VoterState),
         #[error("Invalid candidate: {0}")]
@@ -618,7 +615,7 @@ mod cec {
         pub fn consume_packets(
             &mut self,
             ciphered_data: Vec<BigUint>
-        ) -> Result<(Vec<BigUint>, UnapplyBlindingOps), ConsumePacketsError> {
+        ) -> Result<(Vec<BigUint>, rsa::UnapplyBlindingOps), ConsumePacketsError> {
             let (unapply_blind_ops, mut signed_blinded_candidate_id_vec_vec) = {
                 let packet_data: voter::PacketsData = {
                     let deciphered_byte_data = {
@@ -762,6 +759,74 @@ mod tests {
 
         for el in cec.get_candidates() {
             println!("{:?}", el);
+        }
+    }
+
+    #[test]
+    fn test_double_vote() {
+        let mut voters = (0..10).into_iter().map(|_| voter::Voter::new())
+            .collect::<Vec<_>>();
+
+        let mut cec = cec::Cec::new(
+            (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+            HashMap::from_iter(voters.iter().map(|v| (
+                v.get_id().clone(), cec::VoterState::CanVote(cec::CanVoteState::NotRegistered)))
+            )
+        );
+
+        for voter in &mut voters {
+            let packet = voter.produce_packets(
+                NonZeroUsize::new(10).unwrap(), cec.get_candidates().keys(), &cec.get_public_key()
+            ).unwrap();
+            let signed_candidate_id_vec = cec.consume_packets(packet).unwrap();
+
+            let packet = voter.produce_packets(
+                NonZeroUsize::new(10).unwrap(), cec.get_candidates().keys(), &cec.get_public_key()
+            ).unwrap();
+
+            let signed_candidate_id_vec = cec.consume_packets(packet);
+
+            match signed_candidate_id_vec {
+                Err(
+                    cec::ConsumePacketsError::CheckCandidateIdError(
+                        cec::CheckCandidateIdError::InvalidVoterState(
+                            cec::VoterState::CanVote(cec::CanVoteState::Registered)
+                        )
+                    )
+                ) => {},
+                _ => assert!(false)
+            }
+        }
+    }
+
+    #[test]
+    fn test_illegal_vote() {
+        let mut voters = (0..10).into_iter().map(|_| voter::Voter::new())
+            .collect::<Vec<_>>();
+
+        let mut cec = cec::Cec::new(
+            (0..10).into_iter().map(|i| format!("Candidate {}", i)),
+            HashMap::from_iter(voters.iter().map(|v| (
+                v.get_id().clone(), cec::VoterState::CanNotVote))
+            )
+        );
+
+        for voter in &mut voters {
+            let packet = voter.produce_packets(
+                NonZeroUsize::new(10).unwrap(), cec.get_candidates().keys(), &cec.get_public_key()
+            ).unwrap();
+            let signed_candidate_id_vec = cec.consume_packets(packet);
+
+            match signed_candidate_id_vec {
+                Err(
+                    cec::ConsumePacketsError::CheckCandidateIdError(
+                        cec::CheckCandidateIdError::InvalidVoterState(
+                            cec::VoterState::CanNotVote
+                        )
+                    )
+                ) => {},
+                _ => assert!(false)
+            }
         }
     }
 }

@@ -6,7 +6,7 @@ mod rsa {
     use derive_more::Deref;
     use getset::Getters;
     use lazy_static::lazy_static;
-    use num_bigint::{BigUint, RandBigInt};
+    use num_bigint::{BigUint, RandBigInt, ToBigUint};
     use num_traits::{One, Zero};
     use rand::Rng;
     use serde::{Deserialize, Serialize};
@@ -147,29 +147,20 @@ mod rsa {
     #[error(transparent)]
     pub struct CipherDataError(#[from] ModPowError);
 
-    pub trait CipherUnit {
-        fn to_biguint(&self) -> Cow<BigUint>;
-    }
-
-    impl CipherUnit for u8 {
-        fn to_biguint(&self) -> Cow<BigUint> {
-            Cow::Owned((*self).into())
-        }
-    }
-
-    impl CipherUnit for BigUint {
-        fn to_biguint(&self) -> Cow<BigUint> {
-            Cow::Borrowed(self)
-        }
-    }
-
-    pub fn cipher_data<T: CipherUnit>(key: &impl KeyRef, data: &[T]) -> Result<Vec<BigUint>, CipherDataError> {
+    pub fn cipher_data_biguint(key: &impl KeyRef, mut data: Vec<BigUint>, ) -> Result<Vec<BigUint>, CipherDataError> {
         let (part, product_number) = key.get_parts();
-        let mut ciphered_data = Vec::new();
-        for unit in data {
-            ciphered_data.push(modpow(&unit.to_biguint(), part, product_number)?);
+        for c in &mut data {
+            *c = modpow(c, part, product_number)?;
         }
-        Ok(ciphered_data)
+        Ok(data)
+    }
+
+    pub fn cipher_data_u8(key: &impl KeyRef, data: &[u8]) -> Result<Vec<BigUint>, CipherDataError> {
+        let (part, product_number) = key.get_parts();
+        data.iter().try_fold(Vec::new(), |mut acc, byte| {
+            acc.push(modpow(&BigUint::from(*byte), part, product_number)?);
+            Ok(acc)
+        })
     }
 
     pub struct ApplyBlindingOps {
@@ -194,13 +185,12 @@ mod rsa {
     }
 
     impl UnapplyBlindingOps {
-        pub fn apply(&self, data: &[BigUint]) -> Vec<BigUint> {
-            data.iter().fold(Vec::new(), |mut acc, blinded_byte| {
-                let val = (blinded_byte * &self.mask_multiplicative_inverse)
-                    % (&self.product_number.0);
-                acc.push(val);
-                acc
-            })
+        pub fn apply(&self, mut data: Vec<BigUint>) -> Vec<BigUint> {
+            for unit in &mut data {
+                *unit *= &self.mask_multiplicative_inverse;
+                *unit %= &self.product_number.0;
+            }
+            data
         }
     }
 
@@ -224,7 +214,7 @@ mod rsa {
     #[cfg(test)]
     mod tests {
         use num_traits::ToPrimitive;
-        use super::{cipher_data, create_blinding_ops, CipherDataError, KeyPair};
+        use super::{cipher_data_biguint, cipher_data_u8, create_blinding_ops, CipherDataError, KeyPair};
 
         #[test]
         fn test_blinding() -> Result<(), CipherDataError> {
@@ -240,30 +230,25 @@ mod rsa {
                 let unblinded_signed_data = {
                     let signed_blinded_data = {
                         let unciphered_blinded_data = {
-
                             let ciphered_blinded_data = {
                                 let blinded_data = apply_ops.apply(message.as_bytes());
-
-                                cipher_data(
-                                    &receiver.get_public_key_ref(), &blinded_data
+                                cipher_data_biguint(
+                                    &receiver.get_public_key_ref(), blinded_data
                                 )?
                             };
-
-                            cipher_data(
-                                &receiver.get_private_key_ref(), &ciphered_blinded_data
+                            cipher_data_biguint(
+                                &receiver.get_private_key_ref(), ciphered_blinded_data
                             )?
                         };
-
-                        cipher_data(
-                            &receiver.get_private_key_ref(), &unciphered_blinded_data
+                        cipher_data_biguint(
+                            &receiver.get_private_key_ref(), unciphered_blinded_data
                         )?
                     };
-
-                    unapply_ops.apply(&signed_blinded_data)
+                    unapply_ops.apply(signed_blinded_data)
                 };
 
-                cipher_data(
-                    &receiver.get_public_key_ref(), &unblinded_signed_data
+                cipher_data_biguint(
+                    &receiver.get_public_key_ref(), unblinded_signed_data
                 )?
             };
 
@@ -283,11 +268,11 @@ mod rsa {
         fn test_ciphering() {
             let r = KeyPair::new();
             let message = "message";
-            let ciphered_data = cipher_data(
+            let ciphered_data = cipher_data_u8(
                 &r.get_public_key_ref(), message.as_bytes()
             ).unwrap();
-            let deciphered_data = cipher_data(
-                &r.get_private_key_ref(), &ciphered_data
+            let deciphered_data = cipher_data_biguint(
+                &r.get_private_key_ref(), ciphered_data
             ).unwrap().into_iter().map(|e| e.to_u8().unwrap()).collect();
             let deciphered_message = String::from_utf8(deciphered_data).unwrap();
             assert_eq!(deciphered_message, message);
@@ -301,12 +286,10 @@ mod voter {
     use std::num::NonZeroUsize;
     use getset::Getters;
     use num_bigint::BigUint;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use crate::rsa;
     use crate::rsa::CipherDataError;
-
-    pub const PACKETS_NUMBER: usize = 10;
 
     #[derive(Serialize, Deserialize)]
     pub(crate) struct PacketsData {
@@ -408,17 +391,17 @@ mod voter {
             let packets_data = PacketsData{ blinded_candidate_id_vec_vec, unapply_blind_ops };
             let serialized_packet = bincode::serialize(&packets_data)
                 .map_err(|err| ProducePacketsError::FailedToSerializePackets(err))?;
-            rsa::cipher_data(cec_public_key, &serialized_packet).map_err(Into::into)
+            rsa::cipher_data_u8(cec_public_key, &serialized_packet).map_err(Into::into)
         }
 
         pub fn accept_signed_packet_and_vote(
             &self,
-            ciphered_blinded_vote: &[BigUint],
+            signed_blinded_vote: &[BigUint],
             cec_public_key: &rsa::PublicKeyRef
         ) {
 
         }
-        //
+
         // pub fn vote(&mut self, candidate: &str, cec_public_key: &rsa::PublicKey) -> VoteData {
         //     let gamming_key = rsa::generate_num();
         //
@@ -510,12 +493,8 @@ mod cec {
         ),
         #[error("Failed to deserialize candidate_id: {0}")]
         FailedDeserializedCandidateId(bincode::Error),
-
         #[error(transparent)]
         CheckCandidateIdError(#[from] CheckCandidateIdError),
-
-        #[error("Failed to serialize output packet")]
-        FailedSerializeOutputCandidateIdVec(bincode::Error)
     }
 
     #[derive(Error, Debug)]
@@ -611,12 +590,12 @@ mod cec {
 
         pub fn consume_packets(
             &mut self,
-            ciphered_data: &[BigUint]
+            ciphered_data: Vec<BigUint>
         ) -> Result<Vec<BigUint>, ConsumePacketsError> {
             let (unapply_blind_ops, mut signed_blinded_candidate_id_vec_vec) = {
                 let packet_data: voter::PacketsData = {
                     let deciphered_byte_data = {
-                        let deciphered_data = rsa::cipher_data(
+                        let deciphered_data = rsa::cipher_data_biguint(
                             &self.key_pair.get_private_key_ref(), ciphered_data
                         ).map_err(|err| {
                             ConsumePacketsError::FailedToDecipherPacket(err)
@@ -634,9 +613,9 @@ mod cec {
                             Vec::new(),
                             |mut acc, candidate_id_vec| {
                                 acc.push(
-                                    rsa::cipher_data(
+                                    rsa::cipher_data_biguint(
                                         &self.key_pair.get_private_key_ref(),
-                                        &candidate_id_vec.0
+                                        candidate_id_vec.0
                                     )?
                                 );
                                 Ok(acc)
@@ -653,16 +632,15 @@ mod cec {
                 let unblinded_signed_candidate_id_vec_vec = signed_blinded_candidate_id_vec_vec
                     .into_iter()
                     .map(
-                        |candidate_id_vec|
-                            unapply_blind_ops.apply(&candidate_id_vec)
+                        |candidate_id_vec| unapply_blind_ops.apply(candidate_id_vec)
                     )
                     .collect::<Vec<_>>();
                 let check_candidate_id_vec_vec = {
-                    unblinded_signed_candidate_id_vec_vec.iter()
+                    unblinded_signed_candidate_id_vec_vec.into_iter()
                         .try_fold(
                             Vec::new(),
                             |mut acc, signed_candidate_id_vec| {
-                                rsa::cipher_data(
+                                rsa::cipher_data_biguint(
                                     &self.key_pair.get_public_key_ref(),
                                     signed_candidate_id_vec
                                 ).map_err(ConsumePacketsError::FailedUnsignCandidateIdVec)
@@ -740,7 +718,6 @@ mod cec {
 mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroUsize;
-    use rand::seq::IteratorRandom;
     use crate::{cec, voter};
 
     #[test]
@@ -761,7 +738,7 @@ mod tests {
             let packet = voter.produce_packets(
                 NonZeroUsize::new(10).unwrap(), cec.get_candidates().keys(), &cec.get_public_key()
             ).unwrap();
-            let signed_candidate_id_vec = cec.consume_packets(&packet).unwrap();
+            let signed_candidate_id_vec = cec.consume_packets(packet).unwrap();
 
         }
 

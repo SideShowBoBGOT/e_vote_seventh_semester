@@ -764,46 +764,4 @@ mod tests {
             println!("{:?}", el);
         }
     }
-
-    // #[test]
-    // fn test_can_not_vote() {
-    //     let mut voter = voter::Voter::new();
-    //
-    //     let mut cec = cec::CEC::new(
-    //         (0..10).into_iter().map(|i| format!("Candidate {}", i)),
-    //         HashMap::from([
-    //             (voter.get_public_key(), cec::VoterState::CanNotVote)
-    //         ])
-    //     );
-    //
-    //     let vote_data = voter.vote(
-    //         cec.get_candidates().keys().last().unwrap(),
-    //         &cec.get_public_key()
-    //     );
-    //
-    //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
-    //     assert_eq!(err, cec::VoteError::VoterCanNotVote);
-    // }
-    //
-    // #[test]
-    // fn test_already_voted() {
-    //     let mut voter = voter::Voter::new();
-    //
-    //     let mut cec = cec::CEC::new(
-    //         (0..10).into_iter().map(|i| format!("Candidate {}", i)),
-    //         HashMap::from([
-    //             (voter.get_public_key(), cec::VoterState::CanVote)
-    //         ])
-    //     );
-    //
-    //     let vote_data = voter.vote(
-    //         cec.get_candidates().keys().last().unwrap(),
-    //         &cec.get_public_key()
-    //     );
-    //
-    //     cec.process_vote(&voter.get_public_key(), vote_data.clone()).unwrap();
-    //
-    //     let err = cec.process_vote(&voter.get_public_key(), vote_data).unwrap_err();
-    //     assert_eq!(err, cec::VoteError::VoterAlreadyVoted);
-    // }
 }

@@ -439,6 +439,7 @@ mod voter {
 
 mod cec {
     use std::collections::HashMap;
+    use derive_more::From;
     use num_bigint::BigUint;
     use num_traits::ToPrimitive;
     use thiserror::Error;
@@ -481,12 +482,20 @@ mod cec {
         CanNotVote,
     }
 
+    #[derive(Error, Debug, From)]
+    #[error("Failed to convert deciphered packet to byte data: {0}")]
+    pub struct ConvertToByteDataError(BigUint);
+
+    #[derive(Error, Debug, From)]
+    #[error("Failed to convert unsigned candidate_id_vec to byte data: {0}")]
+    pub struct ConvertUnsignedCandidateIdVecToByteDataError(BigUint);
+
     #[derive(Error, Debug)]
     pub enum ConsumePacketsError {
         #[error("Failed to decipher packet: {0}")]
         FailedToDecipherPacket(rsa::CipherDataError),
-        #[error("Failed to convert deciphered packet to byte data: {0}")]
-        FailedConvertToByteData(BigUint),
+        #[error(transparent)]
+        FailedConvertToByteData(#[from] ConvertToByteDataError),
         #[error("Failed to deserialize packets_data: {0}")]
         FailedToDeserializePackets(bincode::Error),
         #[error("Failed to sign candidate_id_vec: {0}")]
@@ -495,8 +504,10 @@ mod cec {
         PacketDataIsEmpty,
         #[error("Failed to unsign candidate_id: {0}")]
         FailedUnsignCandidateIdVec(rsa::CipherDataError),
-        #[error("Failed to convert unsigned candidate_id_vec to byte data")]
-        FailedConvertUnsignedCandidateIdVecToByteData(BigUint),
+        #[error(transparent)]
+        FailedConvertUnsignedCandidateIdVecToByteData(
+            #[from] ConvertUnsignedCandidateIdVecToByteDataError
+        ),
         #[error("Failed to deserialize candidate_id: {0}")]
         FailedDeserializedCandidateId(bincode::Error),
 
@@ -569,6 +580,21 @@ mod cec {
         Ok(first.get_id().clone())
     }
 
+    fn convert_to_bytes<E>(i: Vec<BigUint>) -> Result<Vec<u8>, E>
+        where
+            E: From<BigUint>
+    {
+        i.into_iter()
+            .try_fold(Vec::new(), |mut acc, unit| {
+                unit.to_u8().ok_or_else(|| {
+                    E::from(unit.clone())
+                }).map(|byte| {
+                    acc.push(byte);
+                    acc
+                })
+            })
+    }
+
     impl CEC {
         pub fn new(
             candidates: impl Iterator<Item=String>,
@@ -596,15 +622,7 @@ mod cec {
                             ).map_err(|err| {
                                 ConsumePacketsError::FailedToDecipherPacket(err)
                             })?;
-                            deciphered_data.into_iter()
-                                .try_fold(Vec::new(), |mut acc, unit| {
-                                    unit.to_u8().ok_or_else(|| {
-                                        ConsumePacketsError::FailedConvertToByteData(unit.clone())
-                                    }).map(|byte| {
-                                        acc.push(byte);
-                                        acc
-                                    })
-                                })?
+                            convert_to_bytes::<ConvertToByteDataError>(deciphered_data)?
                         };
                         bincode::deserialize(&deciphered_byte_data)
                             .map_err(ConsumePacketsError::FailedToDeserializePackets)?
@@ -651,17 +669,8 @@ mod cec {
                                     signed_candidate_id_vec
                                 ).map_err(ConsumePacketsError::FailedUnsignCandidateIdVec)
                                     .and_then(|ser_big_candidate_id_vec| {
-                                        ser_big_candidate_id_vec.into_iter().try_fold(
-                                            Vec::new(),
-                                            |mut acc, unit| {
-                                                unit.to_u8().ok_or_else(|| {
-                                                    ConsumePacketsError::FailedConvertUnsignedCandidateIdVecToByteData(unit)
-                                                }).map(|byte| {
-                                                    acc.push(byte);
-                                                    acc
-                                                })
-                                            }
-                                        )
+                                        convert_to_bytes::<ConvertUnsignedCandidateIdVecToByteDataError>(ser_big_candidate_id_vec)
+                                            .map_err(Into::into)
                                     })
                                     .and_then(|ser_candidate_id_vec| {
                                         bincode::deserialize::<voter::CandidateIdVec>(&ser_candidate_id_vec)
@@ -674,6 +683,8 @@ mod cec {
                             }
                         )?
                 };
+
+
                 // let packet = bincode::serialize(packet_data.get_blinded_candidate_id_vec_vec().first().unwrap())
                 //     .map_err(ConsumePacketsError::FailedSerializeOutputCandidateIdVec)?;
                 // *self.voters_state.get_mut(&voter_id).unwrap() = VoterState::CanVote(CanVoteState::Registered);

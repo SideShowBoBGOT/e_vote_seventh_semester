@@ -1,100 +1,101 @@
-use std::hash::{DefaultHasher, Hasher};
-use num_prime::nt_funcs::{is_prime64};
-use rand::Rng;
-use rand::distributions::uniform::SampleRange;
+mod alg_utils {
+    use num_prime::nt_funcs::is_prime64;
+    use rand::distributions::uniform::SampleRange;
+    use rand::Rng;
 
-fn calculate_hash(data: &[u8]) -> u16 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(data);
-    hasher.finish() as u16
-}
-
-fn positive_mod<T: num_integer::Integer + Copy>(a: T, n: T) -> T {
-    ((a % n) + n) % n
-}
-
-fn modinv(z: u16, a: u16) -> Option<u16> {
-
-    if z == 0 {
-        return None;
+    fn positive_mod<T: num_integer::Integer + Copy>(a: T, n: T) -> T {
+        ((a % n) + n) % n
     }
 
-    if a == 0 || !is_prime64(a as u64) {
-        return None;
+    pub fn modinv(z: u16, a: u16) -> Option<u16> {
+
+        if z == 0 {
+            return None;
+        }
+
+        if a == 0 || !is_prime64(a as u64) {
+            return None;
+        }
+
+        if z >= a {
+            return None;
+        }
+
+        let mut i = a;
+        let mut j = z;
+        let mut y_2: i64 = 0;
+        let mut y_1: i64 = 1;
+
+        while j > 0 {
+            let quotient = i / j;
+            let remainder = i % j;
+            let y = y_2 - (y_1 * quotient as i64);
+            i = j;
+            j = remainder;
+            y_2 = y_1;
+            y_1 = y;
+        }
+        if i != 1 {
+            return None;
+        }
+        Some(positive_mod(y_2, a as i64) as u16)
     }
 
-    if z >= a {
-        return None;
+    pub fn modpow(base: u64, exp: u64, modulus: u64) -> u64 {
+        let mut result = 1;
+        let mut base = base % modulus;
+        let mut exp = exp;
+
+        while exp > 0 {
+            if exp % 2 == 1 {
+                result = (result * base) % modulus;
+            }
+            exp >>= 1;
+            base = (base * base) % modulus;
+        }
+
+        result
     }
 
-    let mut i = a;
-    let mut j = z;
-    let mut y_2: i64 = 0;
-    let mut y_1: i64 = 1;
-
-    while j > 0 {
-        let quotient = i / j;
-        let remainder = i % j;
-        let y = y_2 - (y_1 * quotient as i64);
-        i = j;
-        j = remainder;
-        y_2 = y_1;
-        y_1 = y;
+    pub fn gen_prime<R: SampleRange<u16> + Clone>(r: R) -> u16 {
+        loop {
+            let n = rand::thread_rng().gen_range(r.clone());
+            if is_prime64(n as u64) {
+                break n;
+            }
+        }
     }
-    if i != 1 {
-        return None;
-    }
-    Some(positive_mod(y_2, a as i64) as u16)
-}
 
-#[cfg(test)]
-mod tests {
-    use crate::modinv;
+    #[cfg(test)]
+    mod tests {
+        use super::modinv;
 
-    #[test]
-    fn it_works() {
-        let vals = [(23, 6577), (10, 7919), (17, 3181)];
-        for (z, a) in vals {
-            let res = modinv(z, a).unwrap();
-            let b = z * res;
-            let c = b % a;
-            assert_eq!(c, 1);
+        #[test]
+        fn it_works() {
+            let vals = [(23, 6577), (10, 7919), (17, 3181)];
+            for (z, a) in vals {
+                let res = modinv(z, a).unwrap();
+                let b = z * res;
+                let c = b % a;
+                assert_eq!(c, 1);
+            }
         }
     }
 }
 
-
-
-fn modpow(base: u64, exp: u64, modulus: u64) -> u64 {
-    let mut result = 1;
-    let mut base = base % modulus;
-    let mut exp = exp;
-
-    while exp > 0 {
-        if exp % 2 == 1 {
-            result = (result * base) % modulus;
-        }
-        exp >>= 1;
-        base = (base * base) % modulus;
-    }
-
-    result
-}
-
-fn gen_prime<R: SampleRange<u16> + Clone>(r: R) -> u16 {
-    loop {
-        let n = rand::thread_rng().gen_range(r.clone());
-        if is_prime64(n as u64) {
-            break n;
-        }
-    }
-}
 
 mod dsa {
+    use std::hash::{DefaultHasher, Hasher};
     use std::ops::Rem;
     use rand::Rng;
-    use crate::{calculate_hash, gen_prime, modinv, modpow};
+    use crate::alg_utils::{gen_prime, modinv, modpow};
     use num_prime::nt_funcs::is_prime64;
+
+    fn calculate_hash(data: &[u8]) -> u16 {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(data);
+        hasher.finish() as u16
+    }
 
     pub struct Dsa {
         q: u16,
@@ -197,7 +198,7 @@ mod elgamal {
     use num_traits::ToPrimitive;
     use rand::Rng;
     use thiserror::Error;
-    use crate::{gen_prime, modinv, modpow};
+    use crate::alg_utils::{gen_prime, modinv, modpow};
     use crate::elgamal::DecipherError::CanNotConvertToByte;
 
     pub struct CipheredData {

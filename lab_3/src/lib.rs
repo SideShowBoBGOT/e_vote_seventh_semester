@@ -263,6 +263,7 @@ mod elgamal {
         }
     }
 
+
     pub fn create_keys() -> (PublicKey, PrivateKey) {
         let p = gen_prime(MIN_P..MAX_P);
         let g = gen_prime(1..p);

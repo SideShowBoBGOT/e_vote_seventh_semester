@@ -7,13 +7,8 @@ edition = "2021"
 rand = "0.8.5"
 getset = "0.1.3"
 derive_more = { version = "1.0.0", features = ["deref", "from"] }
-
-lazy_static = "1.5.0"
 thiserror = "1.0.60"
 bincode = "1.3.3"
 serde = { version = "1.0.210", features = ["derive"] }
-
-num-integer = "0.1.46"
-num-bigint = { version = "0.4.6", features = ["rand", "serde"] }
-num-traits = "0.2.19"
 num-prime = "0.4.4"
+num-traits = "0.2.19"

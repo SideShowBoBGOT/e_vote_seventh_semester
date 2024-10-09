@@ -3,7 +3,7 @@ mod alg_utils {
     use rand::distributions::uniform::SampleRange;
     use rand::Rng;
 
-    fn positive_mod<T: num_integer::Integer + Copy>(a: T, n: T) -> T {
+    fn positive_mod(a: i64, n: i64) -> i64 {
         ((a % n) + n) % n
     }
 
@@ -263,7 +263,6 @@ mod elgamal {
         }
     }
 
-
     pub fn create_keys() -> (PublicKey, PrivateKey) {
         let p = gen_prime(MIN_P..MAX_P);
         let g = gen_prime(1..p);
@@ -285,4 +284,112 @@ mod elgamal {
             assert_eq!(message, deciphered_message);
         }
     }
+}
+
+mod sim_env {
+    use rand::Rng;
+
+    fn gen_large_num() -> u64 {
+        const MIN: u64 = u32::MAX as u64;
+        const MAX: u64 = u64::MAX;
+        rand::thread_rng().gen_range(MIN..MAX)
+    }
+
+    mod voter {
+        use serde::{Deserialize, Serialize};
+        use crate::sim_env::{cec, gen_large_num};
+        use crate::sim_env::reg_bureau::RegistrationNumber;
+
+        #[derive(Serialize, Deserialize, PartialEq, Eq)]
+        pub struct CitizenId(u64);
+
+        #[derive(Serialize, Deserialize)]
+        pub struct VoteId(pub u64);
+
+        pub struct Voter {
+            citizen_id: CitizenId,
+            vote_id: VoteId,
+        }
+
+        #[derive(Serialize)]
+        struct VoteDataRef<'a> {
+            vote_id: VoteId,
+            reg_num: RegistrationNumber,
+            candidate: &'a cec::Candidate
+        }
+
+        #[derive(Deserialize)]
+        struct VoteData {
+            vote_id: VoteId,
+            reg_num: RegistrationNumber,
+            candidate: cec::Candidate
+        }
+
+        impl Voter {
+            pub fn new() -> Self {
+                Self {
+                    citizen_id: CitizenId(gen_large_num()),
+                    vote_id: VoteId(gen_large_num()),
+                }
+            }
+
+            pub fn vote(
+                &self,
+                reg_num: RegistrationNumber,
+                candidate: &cec::Candidate,
+
+            ) {
+                let vote_id = VoteId(gen_large_num());
+                let vote_data_ref = VoteDataRef {
+                    vote_id, reg_num, candidate
+                };
+
+
+            }
+        }
+    }
+
+    mod cec {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        pub struct Candidate(String);
+    }
+
+    mod reg_bureau {
+        use serde::{Deserialize, Serialize};
+        use crate::sim_env::gen_large_num;
+        use crate::sim_env::voter::CitizenId;
+
+        #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+        pub struct RegistrationNumber(pub u64);
+
+        pub struct RegistrationBureau {
+            cit_reg: Vec<(CitizenId, RegistrationNumber)>
+        }
+
+        impl RegistrationBureau {
+            fn give_reg_num(&mut self, citizen_id: CitizenId) -> Option<RegistrationNumber> {
+
+                if self.cit_reg.iter().any(|(cit_id, _)| {
+                    cit_id == &citizen_id
+                }) {
+                    loop {
+                        let num = RegistrationNumber(gen_large_num());
+                        if self.cit_reg.iter().all(|(_, reg_num)| {
+                            reg_num != &num
+                        }) {
+                            self.cit_reg.push((citizen_id, num));
+                            break Some(num);
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+
+
 }

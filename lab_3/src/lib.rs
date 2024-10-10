@@ -90,6 +90,7 @@ mod dsa {
     use rand::Rng;
     use crate::alg_utils::{gen_prime, modinv, modpow};
     use num_prime::nt_funcs::is_prime64;
+    use serde::{Deserialize, Serialize};
 
     fn calculate_hash(data: &[u8]) -> u16 {
         let mut hasher = DefaultHasher::new();
@@ -104,6 +105,7 @@ mod dsa {
         x: u16
     }
 
+    #[derive(Serialize, Deserialize)]
     pub struct PublicKey {
         q: u16,
         p: u64,
@@ -111,6 +113,7 @@ mod dsa {
         y: u64,
     }
 
+    #[derive(Serialize, Deserialize)]
     pub struct Signature {
         r: u16,
         s: u16,
@@ -206,18 +209,21 @@ mod dsa {
 mod elgamal {
     use num_traits::ToPrimitive;
     use rand::Rng;
+    use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use crate::alg_utils::{gen_prime, modinv, modpow};
     use crate::elgamal::DecipherError::CanNotConvertToByte;
 
+    #[derive(Serialize, Deserialize)]
     pub struct CipheredData {
-        a: u16,
-        bs: Vec<u16>
+        pub a: u16,
+        pub bs: Vec<u16>
     }
 
     const MIN_P: u16 = u8::MAX as u16 + 1;
     const MAX_P: u16 = u16::MAX;
 
+    #[derive(Serialize, Deserialize)]
     pub struct PublicKey {
         g: u16,
         y: u16,
@@ -306,6 +312,9 @@ mod sim_env {
 
     mod voter {
         use serde::{Deserialize, Serialize};
+        use thiserror::Error;
+        use crate::{dsa, elgamal};
+        use crate::dsa::Signature;
         use crate::sim_env::{cec, gen_large_num};
         use crate::sim_env::reg_bureau::RegistrationNumber;
 
@@ -324,14 +333,24 @@ mod sim_env {
         struct VoteDataRef<'a> {
             vote_id: VoteId,
             reg_num: RegistrationNumber,
-            candidate: &'a cec::Candidate
+            candidate: &'a cec::Candidate,
+            public_key: dsa::PublicKey
         }
 
         #[derive(Deserialize)]
         struct VoteData {
             vote_id: VoteId,
             reg_num: RegistrationNumber,
-            candidate: cec::Candidate
+            candidate: cec::Candidate,
+            public_key: dsa::PublicKey
+        }
+
+        #[derive(Error, Debug)]
+        pub enum VoteError {
+            #[error(transparent)]
+            VoteSerialization(bincode::Error),
+            #[error(transparent)]
+            CipherSerialization(bincode::Error),
         }
 
         impl Voter {
@@ -346,14 +365,27 @@ mod sim_env {
                 &self,
                 reg_num: RegistrationNumber,
                 candidate: &cec::Candidate,
+                cec_public_key: elgamal::PublicKey,
+            ) -> Result<(Vec<u8>, Signature), VoteError> {
+                let sign_keys = dsa::create_keys();
 
-            ) {
-                let vote_id = VoteId(gen_large_num());
-                let vote_data_ref = VoteDataRef {
-                    vote_id, reg_num, candidate
+                let ser_ciphered_data = {
+                    let ciphered_data = {
+                        let ser_vote_data = {
+                            let vote_data_ref = VoteDataRef {
+                                vote_id: VoteId(gen_large_num()),
+                                reg_num, candidate, public_key: sign_keys.0
+                            };
+                            bincode::serialize(&vote_data_ref)
+                                .map_err(VoteError::VoteSerialization)?
+                        };
+                        cec_public_key.cipher(&ser_vote_data)
+                    };
+                    bincode::serialize(&ciphered_data)
+                        .map_err(VoteError::CipherSerialization)?
                 };
-
-
+                let signature = sign_keys.1.sign(&ser_ciphered_data);
+                Ok((ser_ciphered_data, signature))
             }
         }
     }
@@ -398,7 +430,4 @@ mod sim_env {
             }
         }
     }
-
-
-
 }

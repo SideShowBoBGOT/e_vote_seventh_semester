@@ -97,11 +97,17 @@ mod dsa {
         hasher.finish() as u16
     }
 
-    pub struct Dsa {
+    pub struct PrivateKey {
         q: u16,
         p: u64,
         g: u64,
-        x: u16,
+        x: u16
+    }
+
+    pub struct PublicKey {
+        q: u16,
+        p: u64,
+        g: u64,
         y: u64,
     }
 
@@ -110,39 +116,40 @@ mod dsa {
         s: u16,
     }
 
-    impl Dsa {
-        pub fn new() -> Self {
-            let (q, p) = 'qp_loop: loop {
-                const N: usize = 16;
-                const MIN: u16 = (1 << (N - 1)) as u16;
-                const MAX: u16 = ((1 << N) - 1) as u16;
-                let q = gen_prime(MIN..MAX);
-                let mut p_1 = (q as u64) * 2;
-                loop {
-                    if u64::MAX - p_1 < q as u64 {
-                        continue 'qp_loop;
-                    }
-                    let p = p_1 + 1;
-                    if is_prime64(p) && p_1 % q as u64 == 0 {
-                        break 'qp_loop (q, p);
-                    }
-                    p_1 += q as u64;
+    pub fn create_keys() -> (PublicKey, PrivateKey) {
+        let (q, p) = 'qp_loop: loop {
+            const N: usize = 16;
+            const MIN: u16 = (1 << (N - 1)) as u16;
+            const MAX: u16 = ((1 << N) - 1) as u16;
+            let q = gen_prime(MIN..MAX);
+            let mut p_1 = (q as u64) * 2;
+            loop {
+                if u64::MAX - p_1 < q as u64 {
+                    continue 'qp_loop;
                 }
-            };
-
-            let g = loop {
-                let h = rand::thread_rng().gen_range(1..p-1);
-                let g = modpow(h, (p - 1) / q as u64, p);
-                if g > 1 {
-                    break g;
+                let p = p_1 + 1;
+                if is_prime64(p) && p_1 % q as u64 == 0 {
+                    break 'qp_loop (q, p);
                 }
-            };
+                p_1 += q as u64;
+            }
+        };
 
-            let x = rand::thread_rng().gen_range(0..q);
-            let y = modpow(g, x as u64, p);
-            Self { p, q, g, x, y }
-        }
+        let g = loop {
+            let h = rand::thread_rng().gen_range(1..p-1);
+            let g = modpow(h, (p - 1) / q as u64, p);
+            if g > 1 {
+                break g;
+            }
+        };
 
+        let x = rand::thread_rng().gen_range(0..q);
+        let y = modpow(g, x as u64, p);
+
+        (PublicKey { q, p, g, y }, PrivateKey { q, p, g, x })
+    }
+
+    impl PrivateKey {
         pub fn sign(&self, data: &[u8]) -> Signature {
             let data_hash = calculate_hash(data);
             loop {
@@ -161,22 +168,24 @@ mod dsa {
         }
     }
 
-    pub fn verify(dsa: &Dsa, signature: &Signature, data: &[u8]) -> bool {
-        if ![signature.s, signature.r].iter().all(|num| {
-            *num > 0 && *num < dsa.q
-        }) {
-            return false;
-        }
-        if let Some(w) = modinv(signature.s, dsa.q) {
-            let data_hash = calculate_hash(data);
-            let u_one = (data_hash as u64 * w as u64).rem(dsa.q as u64) as u16;
-            let u_two = (signature.r as u64 * w as u64).rem(dsa.q as u64) as u16;
-            let v_one = modpow(dsa.g, u_one as u64, dsa.p) as u128;
-            let v_two = modpow(dsa.y, u_two as u64, dsa.p) as u128;
-            let v = ((((v_one * v_two) % dsa.p as u128) as u64) % dsa.q as u64) as u16;
-            v == signature.r
-        } else {
-            false
+    impl PublicKey {
+        pub fn verify(&self, signature: &Signature, data: &[u8]) -> bool {
+            if ![signature.s, signature.r].iter().all(|num| {
+                *num > 0 && *num < self.q
+            }) {
+                return false;
+            }
+            if let Some(w) = modinv(signature.s, self.q) {
+                let data_hash = calculate_hash(data);
+                let u_one = (data_hash as u64 * w as u64).rem(self.q as u64) as u16;
+                let u_two = (signature.r as u64 * w as u64).rem(self.q as u64) as u16;
+                let v_one = modpow(self.g, u_one as u64, self.p) as u128;
+                let v_two = modpow(self.y, u_two as u64, self.p) as u128;
+                let v = ((((v_one * v_two) % self.p as u128) as u64) % self.q as u64) as u16;
+                v == signature.r
+            } else {
+                false
+            }
         }
     }
 
@@ -186,9 +195,9 @@ mod dsa {
         #[test]
         fn it_works() {
             let message = "message";
-            let dsa = super::Dsa::new();
-            let signature = dsa.sign(message.as_bytes());
-            let res = super::verify(&dsa, &signature, message.as_bytes());
+            let (public_key, private_key) = super::create_keys();
+            let signature = private_key.sign(message.as_bytes());
+            let res = public_key.verify(&signature, message.as_bytes());
             assert!(res);
         }
     }

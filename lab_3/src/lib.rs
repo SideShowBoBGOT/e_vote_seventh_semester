@@ -404,18 +404,30 @@ mod sim_env {
     }
 
     mod cec {
+        use std::collections::HashMap;
         use serde::{Deserialize, Serialize};
         use thiserror::Error;
         use crate::elgamal;
         use crate::sim_env::{reg_bureau, voter};
         use crate::sim_env::voter::Vote;
 
-        #[derive(Serialize, Deserialize)]
-        pub struct Candidate(String);
+        #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+        pub struct Candidate(pub String);
 
         pub struct Cec {
             key_pair: elgamal::KeyPair,
             voter_ids: Vec<voter::VoteId>,
+            candidates: HashMap<Candidate, u64>,
+        }
+
+        impl Cec {
+            pub fn new(candidates: impl Iterator<Item=Candidate>) -> Self {
+                Self {
+                    key_pair: elgamal::create_keys(),
+                    voter_ids: Default::default(),
+                    candidates: HashMap::from_iter(candidates.map(|c| (c, 0))),
+                }
+            }
         }
 
         #[derive(Error, Debug)]
@@ -426,6 +438,8 @@ mod sim_env {
             Decipher(#[from] elgamal::DecipherError),
             #[error(transparent)]
             DeserializeVoteData(bincode::Error),
+            #[error("Invalid candidate: {0:?}")]
+            InvalidCandidate(Candidate),
             #[error("Failed verification")]
             Verification,
             #[error(transparent)]
@@ -448,14 +462,18 @@ mod sim_env {
                     bincode::deserialize::<voter::VoteData>(&data)
                         .map_err(ProcessVoteError::DeserializeVoteData)?
                 };
-                if vote_data.public_key.verify(&vote.signature, vote_data.candidate.0.as_bytes()) {
-                    reg_bureau.update_registration(vote_data.reg_num)
-                        .map_err(ProcessVoteError::UpdateRegistration)
-                        .map(|_| {
-                            self.voter_ids.push(vote_data.vote_id);
-                        })
+                if self.candidates.contains_key(&vote_data.candidate) {
+                    if vote_data.public_key.verify(&vote.signature, vote_data.candidate.0.as_bytes()) {
+                        reg_bureau.update_registration(vote_data.reg_num)
+                            .map_err(ProcessVoteError::UpdateRegistration)
+                            .map(|_| {
+                                self.voter_ids.push(vote_data.vote_id);
+                            })
+                    } else {
+                        Err(ProcessVoteError::Verification)
+                    }
                 } else {
-                    Err(ProcessVoteError::Verification)
+                    Err(ProcessVoteError::InvalidCandidate(vote_data.candidate))
                 }
             }
         }
@@ -475,6 +493,7 @@ mod sim_env {
             vote_state: VoteState
         }
 
+        #[derive(Default)]
         pub struct RegistrationBureau(Vec<Row>);
 
         enum VoteState {
@@ -525,6 +544,21 @@ mod sim_env {
                     Err(GiveRegNumberError(citizen_id))
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{reg_bureau, cec, voter};
+
+        #[test]
+        fn it_works() {
+            let mut reg_bureau = reg_bureau::RegistrationBureau::default();
+            let mut cec = cec::Cec::new(
+                (0..10).into_iter().map(|i| cec::Candidate(i.to_string()))
+            );
+
+
         }
     }
 }

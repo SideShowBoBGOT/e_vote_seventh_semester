@@ -376,12 +376,12 @@ mod sim_env {
                 &self,
                 reg_bureau: &mut impl reg_bureau::GiveRegNumber,
                 candidate: &cec::Candidate,
-                cec_public_key: elgamal::PublicKey,
+                cec_public_key: &elgamal::PublicKey,
             ) -> Result<Vote, VoteError> {
                 let sign_keys = dsa::create_keys();
 
-                let ser_ciphered_data = {
-                    let ciphered_data = {
+                let (signature, ser_ciphered_data) = {
+                    let (signature, ciphered_data) = {
                         let ser_vote_data = {
                             let reg_num = reg_bureau.give_reg_num(self.citizen_id)
                                 .map_err(VoteError::GiveRegNumber)?;
@@ -392,12 +392,15 @@ mod sim_env {
                             bincode::serialize(&vote_data_ref)
                                 .map_err(VoteError::VoteSerialization)?
                         };
-                        cec_public_key.cipher(&ser_vote_data)
+                        let signature = sign_keys.1.sign(&ser_vote_data);
+                        (signature, cec_public_key.cipher(&ser_vote_data))
                     };
-                    bincode::serialize(&ciphered_data)
-                        .map_err(VoteError::CipherSerialization)?
+                    (
+                        signature,
+                        bincode::serialize(&ciphered_data)
+                            .map_err(VoteError::CipherSerialization)?
+                    )
                 };
-                let signature = sign_keys.1.sign(&ser_ciphered_data);
                 Ok(Vote { ser_ciphered_data, signature })
             }
         }
@@ -428,6 +431,14 @@ mod sim_env {
                     candidates: HashMap::from_iter(candidates.map(|c| (c, 0))),
                 }
             }
+
+            pub fn get_candidates(&self) -> &HashMap<Candidate, u64> {
+                &self.candidates
+            }
+
+            pub fn get_public_key(&self) -> &elgamal::PublicKey {
+                &self.key_pair.public_key
+            }
         }
 
         #[derive(Error, Debug)]
@@ -452,28 +463,28 @@ mod sim_env {
                 vote: Vote,
                 reg_bureau: &mut impl reg_bureau::UpdateRegistration
             ) -> Result<(), ProcessVoteError> {
-                let vote_data = {
-                    let data = {
-                        let ciphered_data = bincode::deserialize::<elgamal::CipheredData>(&vote.ser_ciphered_data)
-                            .map_err(ProcessVoteError::DeserializeCipherData)?;
-                        self.key_pair.private_key.decipher(&ciphered_data)
-                            .map_err(ProcessVoteError::Decipher)?
-                    };
-                    bincode::deserialize::<voter::VoteData>(&data)
-                        .map_err(ProcessVoteError::DeserializeVoteData)?
+
+                let data = {
+                    let ciphered_data = bincode::deserialize::<elgamal::CipheredData>(&vote.ser_ciphered_data)
+                        .map_err(ProcessVoteError::DeserializeCipherData)?;
+                    self.key_pair.private_key.decipher(&ciphered_data)
+                        .map_err(ProcessVoteError::Decipher)?
                 };
-                if self.candidates.contains_key(&vote_data.candidate) {
-                    if vote_data.public_key.verify(&vote.signature, vote_data.candidate.0.as_bytes()) {
+                let vote_data = bincode::deserialize::<voter::VoteData>(&data)
+                        .map_err(ProcessVoteError::DeserializeVoteData)?;
+                if vote_data.public_key.verify(&vote.signature, &data) {
+                    if self.candidates.contains_key(&vote_data.candidate) {
                         reg_bureau.update_registration(vote_data.reg_num)
                             .map_err(ProcessVoteError::UpdateRegistration)
                             .map(|_| {
+                                *self.candidates.get_mut(&vote_data.candidate).unwrap() += 1;
                                 self.voter_ids.push(vote_data.vote_id);
                             })
                     } else {
-                        Err(ProcessVoteError::Verification)
+                        Err(ProcessVoteError::InvalidCandidate(vote_data.candidate))
                     }
                 } else {
-                    Err(ProcessVoteError::InvalidCandidate(vote_data.candidate))
+                    Err(ProcessVoteError::Verification)
                 }
             }
         }
@@ -533,6 +544,8 @@ mod sim_env {
                 if self.0.iter().any(|r| {
                     r.citizen_id == citizen_id
                 }) {
+                    Err(GiveRegNumberError(citizen_id))
+                } else {
                     loop {
                         let reg_num = RegistrationNumber(gen_large_num());
                         if self.0.iter().all(|r| r.reg_num != reg_num) {
@@ -540,8 +553,6 @@ mod sim_env {
                             break Ok(reg_num);
                         }
                     }
-                } else {
-                    Err(GiveRegNumberError(citizen_id))
                 }
             }
         }
@@ -549,6 +560,7 @@ mod sim_env {
 
     #[cfg(test)]
     mod tests {
+        use rand::prelude::IteratorRandom;
         use super::{reg_bureau, cec, voter};
 
         #[test]
@@ -557,8 +569,23 @@ mod sim_env {
             let mut cec = cec::Cec::new(
                 (0..10).into_iter().map(|i| cec::Candidate(i.to_string()))
             );
+            let voters = (0..100).into_iter()
+                .map(|_| voter::Voter::new()).collect::<Vec<_>>();
 
+            let mut rng = rand::thread_rng();
 
+            for voter in &voters {
+                let vote = voter.vote(
+                    &mut reg_bureau,
+                    cec.get_candidates().iter().choose(&mut rng).unwrap().0,
+                    cec.get_public_key()
+                ).unwrap();
+                cec.process_vote(vote, &mut reg_bureau).unwrap();
+            }
+
+            for item in cec.get_candidates().iter() {
+                println!("{:?}", item);
+            }
         }
     }
 }

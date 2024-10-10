@@ -587,5 +587,38 @@ mod sim_env {
                 println!("{:?}", item);
             }
         }
+
+        #[test]
+        #[should_panic]
+        fn can_not_vote_several_times() {
+            let mut reg_bureau = reg_bureau::RegistrationBureau::default();
+            let mut cec = cec::Cec::new(
+                (0..10).into_iter().map(|i| cec::Candidate(i.to_string()))
+            );
+            let voters = (0..100).into_iter()
+                .map(|_| voter::Voter::new()).collect::<Vec<_>>();
+
+            let mut rng = rand::thread_rng();
+
+            for voter in &voters {
+                let vote = voter.vote(
+                    &mut reg_bureau,
+                    cec.get_candidates().iter().choose(&mut rng).unwrap().0,
+                    cec.get_public_key()
+                ).unwrap();
+
+                let vote = voter.vote(
+                    &mut reg_bureau,
+                    cec.get_candidates().iter().choose(&mut rng).unwrap().0,
+                    cec.get_public_key()
+                ).unwrap();
+
+                cec.process_vote(vote, &mut reg_bureau).unwrap();
+            }
+
+            for item in cec.get_candidates().iter() {
+                println!("{:?}", item);
+            }
+        }
     }
 }

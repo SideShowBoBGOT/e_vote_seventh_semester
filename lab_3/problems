@@ -1,0 +1,61 @@
+modinv ::
+
+type DSA
+    (N, q, p, g, x, y)
+        where
+            N
+                where
+                    required
+                        is_natural(N)
+            q = rand(range(pow(2, N - 1), pow(2, N)))
+                where
+                    required
+                        is_prime(q)
+            p
+                where
+                    required
+                        is_prime(p)
+                    required
+                        mod(p - 1, q) == 0
+            g = mod(pow(h, (p - 1) / q), p)
+            x = rand(range(0, q))
+            y = mod(pow(g, x), p)
+
+type Signature(dsa: DSA, hash_func: H, message: [byte]) = (r, s)
+    where
+        k_inv = modinv(k, q)
+            where
+                k = rand(range(0, dsa.q))
+                required
+                    k_inv is in range(0, q)
+        r = mod(mod(pow(g, k), p), q)
+            where
+                required
+                    r != 0
+        z = left_most_bits(hash_func(message), min_bits)
+            where
+                min_bits = min(N, sizeof(return_type(hash_func)))
+        s = mod(mul(k_inv, sum(z, mul(x, r))), q)
+            where
+                required
+                    s != 0
+
+verify(signature: Signature, dsa: DSA, hash_func: H, message: [byte]) =
+    where
+        required
+            signature.r > 0
+            signature.r < q
+            signature.s > 0
+            signature.s < q
+        v = mod(mod(mul(pow(dsa.g, u_1), pow(dsa.y, u_2)), dsa.p), dsa.q)
+            where
+                (u1, u2) = (mod(mul(z, w), dsa.q), mod(mul(signature.r, w), dsa.q))
+                    where
+                        w = modinv(signature.s, dsa.q)
+                        z = left_most_bits(hash_func(message), min_bits)
+                            where
+                                min_bits = min(N, sizeof(return_type(hash_func)))
+
+
+
+

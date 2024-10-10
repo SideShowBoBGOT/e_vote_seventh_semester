@@ -278,12 +278,17 @@ mod elgamal {
         }
     }
 
-    pub fn create_keys() -> (PublicKey, PrivateKey) {
+    pub struct KeyPair {
+        pub private_key: PrivateKey,
+        pub public_key: PublicKey,
+    }
+
+    pub fn create_keys() -> KeyPair {
         let p = gen_prime(MIN_P..MAX_P);
         let g = gen_prime(1..p);
         let x = rand::thread_rng().gen_range(1..(p - 2));
         let y = modpow(g as u64, x as u64, p as u64) as u16;
-        (PublicKey { g, y, p }, PrivateKey { p, x })
+        KeyPair { public_key: PublicKey { g, y, p }, private_key: PrivateKey { p, x } }
     }
 
     #[cfg(test)]
@@ -292,9 +297,9 @@ mod elgamal {
         #[test]
         fn it_works() {
             let message = "message";
-            let (public_key, private_key) = super::create_keys();
-            let c_data = public_key.cipher(message.as_bytes());
-            let data = private_key.decipher(&c_data).unwrap();
+            let key_pair = super::create_keys();
+            let c_data = key_pair.public_key.cipher(message.as_bytes());
+            let data = key_pair.private_key.decipher(&c_data).unwrap();
             let deciphered_message = String::from_utf8(data).unwrap();
             assert_eq!(message, deciphered_message);
         }
@@ -315,10 +320,9 @@ mod sim_env {
         use thiserror::Error;
         use crate::{dsa, elgamal};
         use crate::dsa::Signature;
-        use crate::sim_env::{cec, gen_large_num};
-        use crate::sim_env::reg_bureau::RegistrationNumber;
+        use crate::sim_env::{cec, gen_large_num, reg_bureau};
 
-        #[derive(Serialize, Deserialize, PartialEq, Eq)]
+        #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
         pub struct CitizenId(u64);
 
         #[derive(Serialize, Deserialize)]
@@ -332,21 +336,28 @@ mod sim_env {
         #[derive(Serialize)]
         struct VoteDataRef<'a> {
             vote_id: VoteId,
-            reg_num: RegistrationNumber,
+            reg_num: reg_bureau::RegistrationNumber,
             candidate: &'a cec::Candidate,
             public_key: dsa::PublicKey
         }
 
         #[derive(Deserialize)]
-        struct VoteData {
-            vote_id: VoteId,
-            reg_num: RegistrationNumber,
-            candidate: cec::Candidate,
-            public_key: dsa::PublicKey
+        pub struct VoteData {
+            pub vote_id: VoteId,
+            pub reg_num: reg_bureau::RegistrationNumber,
+            pub candidate: cec::Candidate,
+            pub public_key: dsa::PublicKey
+        }
+
+        pub struct Vote {
+            pub ser_ciphered_data: Vec<u8>,
+            pub signature: Signature
         }
 
         #[derive(Error, Debug)]
         pub enum VoteError {
+            #[error(transparent)]
+            GiveRegNumber(reg_bureau::GiveRegNumberError),
             #[error(transparent)]
             VoteSerialization(bincode::Error),
             #[error(transparent)]
@@ -363,15 +374,17 @@ mod sim_env {
 
             pub fn vote(
                 &self,
-                reg_num: RegistrationNumber,
+                reg_bureau: &mut impl reg_bureau::GiveRegNumber,
                 candidate: &cec::Candidate,
                 cec_public_key: elgamal::PublicKey,
-            ) -> Result<(Vec<u8>, Signature), VoteError> {
+            ) -> Result<Vote, VoteError> {
                 let sign_keys = dsa::create_keys();
 
                 let ser_ciphered_data = {
                     let ciphered_data = {
                         let ser_vote_data = {
+                            let reg_num = reg_bureau.give_reg_num(self.citizen_id)
+                                .map_err(VoteError::GiveRegNumber)?;
                             let vote_data_ref = VoteDataRef {
                                 vote_id: VoteId(gen_large_num()),
                                 reg_num, candidate, public_key: sign_keys.0
@@ -385,47 +398,131 @@ mod sim_env {
                         .map_err(VoteError::CipherSerialization)?
                 };
                 let signature = sign_keys.1.sign(&ser_ciphered_data);
-                Ok((ser_ciphered_data, signature))
+                Ok(Vote { ser_ciphered_data, signature })
             }
         }
     }
 
     mod cec {
         use serde::{Deserialize, Serialize};
+        use thiserror::Error;
+        use crate::elgamal;
+        use crate::sim_env::{reg_bureau, voter};
+        use crate::sim_env::voter::Vote;
 
         #[derive(Serialize, Deserialize)]
         pub struct Candidate(String);
+
+        pub struct Cec {
+            key_pair: elgamal::KeyPair,
+            voter_ids: Vec<voter::VoteId>,
+        }
+
+        #[derive(Error, Debug)]
+        pub enum ProcessVoteError {
+            #[error(transparent)]
+            DeserializeCipherData(bincode::Error),
+            #[error(transparent)]
+            Decipher(#[from] elgamal::DecipherError),
+            #[error(transparent)]
+            DeserializeVoteData(bincode::Error),
+            #[error("Failed verification")]
+            Verification,
+            #[error(transparent)]
+            UpdateRegistration(#[from] reg_bureau::UpdateRegistrationError)
+        }
+
+        impl Cec {
+            pub fn process_vote(
+                &mut self,
+                vote: Vote,
+                reg_bureau: &mut impl reg_bureau::UpdateRegistration
+            ) -> Result<(), ProcessVoteError> {
+                let vote_data = {
+                    let data = {
+                        let ciphered_data = bincode::deserialize::<elgamal::CipheredData>(&vote.ser_ciphered_data)
+                            .map_err(ProcessVoteError::DeserializeCipherData)?;
+                        self.key_pair.private_key.decipher(&ciphered_data)
+                            .map_err(ProcessVoteError::Decipher)?
+                    };
+                    bincode::deserialize::<voter::VoteData>(&data)
+                        .map_err(ProcessVoteError::DeserializeVoteData)?
+                };
+                if vote_data.public_key.verify(&vote.signature, vote_data.candidate.0.as_bytes()) {
+                    reg_bureau.update_registration(vote_data.reg_num)
+                        .map_err(ProcessVoteError::UpdateRegistration)
+                        .map(|_| {
+                            self.voter_ids.push(vote_data.vote_id);
+                        })
+                } else {
+                    Err(ProcessVoteError::Verification)
+                }
+            }
+        }
     }
 
     mod reg_bureau {
         use serde::{Deserialize, Serialize};
-        use crate::sim_env::gen_large_num;
-        use crate::sim_env::voter::CitizenId;
+        use thiserror::Error;
+        use crate::sim_env::{gen_large_num, voter};
 
-        #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+        #[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
         pub struct RegistrationNumber(pub u64);
 
-        pub struct RegistrationBureau {
-            cit_reg: Vec<(CitizenId, RegistrationNumber)>
+        struct Row {
+            citizen_id: voter::CitizenId,
+            reg_num: RegistrationNumber,
+            vote_state: VoteState
         }
 
-        impl RegistrationBureau {
-            fn give_reg_num(&mut self, citizen_id: CitizenId) -> Option<RegistrationNumber> {
+        pub struct RegistrationBureau(Vec<Row>);
 
-                if self.cit_reg.iter().any(|(cit_id, _)| {
-                    cit_id == &citizen_id
+        enum VoteState {
+            Voted,
+            NotVoted
+        }
+
+        #[derive(Error, Debug)]
+        #[error("Registration number is already voted: {0:?}")]
+        pub struct UpdateRegistrationError(RegistrationNumber);
+
+        pub trait UpdateRegistration {
+            fn update_registration(&mut self, reg_num: RegistrationNumber)
+                -> Result<(), UpdateRegistrationError>;
+        }
+
+        impl UpdateRegistration for RegistrationBureau {
+            fn update_registration(&mut self, reg_num: RegistrationNumber)
+                -> Result<(), UpdateRegistrationError> {
+                self.0.iter_mut().find(|r| r.reg_num == reg_num)
+                    .ok_or(UpdateRegistrationError(reg_num))
+                    .map(|r| r.vote_state = VoteState::Voted)
+            }
+        }
+
+        #[derive(Error, Debug)]
+        #[error("Registration number exists: {0:?}")]
+        pub struct GiveRegNumberError(voter::CitizenId);
+
+        pub trait GiveRegNumber {
+            fn give_reg_num(&mut self, citizen_id: voter::CitizenId) -> Result<RegistrationNumber, GiveRegNumberError>;
+        }
+
+        impl GiveRegNumber for RegistrationBureau {
+            fn give_reg_num(&mut self, citizen_id: voter::CitizenId) -> Result<RegistrationNumber, GiveRegNumberError> {
+
+                if self.0.iter().any(|r| {
+                    r.citizen_id == citizen_id
                 }) {
                     loop {
-                        let num = RegistrationNumber(gen_large_num());
-                        if self.cit_reg.iter().all(|(_, reg_num)| {
-                            reg_num != &num
-                        }) {
-                            self.cit_reg.push((citizen_id, num));
-                            break Some(num);
+                        let reg_num = RegistrationNumber(gen_large_num());
+                        if self.0.iter().all(|r| r.reg_num != reg_num) {
+                            self.0.push(Row { citizen_id, reg_num, vote_state: VoteState::NotVoted });
+                            break Ok(reg_num);
                         }
                     }
                 } else {
-                    None
+                    Err(GiveRegNumberError(citizen_id))
                 }
             }
         }

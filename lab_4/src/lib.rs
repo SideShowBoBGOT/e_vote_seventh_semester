@@ -378,11 +378,13 @@ mod elgamal {
 
 mod voter {
     use num_bigint::BigUint;
+    use num_traits::FromPrimitive;
     use rand::prelude::IteratorRandom;
     use rand::Rng;
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use crate::{elgamal, rsa};
+    use crate::elgamal::DecipherError;
 
     #[derive(Default)]
     pub struct Voter {
@@ -403,40 +405,24 @@ mod voter {
         }
     }
 
-    fn generate_noise() -> Vec<u8> {
-        (0..10).into_iter().map(|_|{
-            rand::thread_rng().gen_range(0u8..u8::MAX)
-        }).collect::<Vec<_>>()
+    fn create_noise_it(noise_length: usize) -> impl Iterator<Item=BigUint> {
+        (0..noise_length).into_iter().map(|_| {
+            BigUint::from_u8(rand::thread_rng().gen_range(0u8..u8::MAX)).unwrap()
+        })
     }
 
-    macro_rules! complex_wrap_data {
-        ($name:ident) => {
-            #[derive(Serialize, Deserialize, Debug)]
-            struct $name {
-                data: Vec<u8>,
-                noise: Vec<u8>,
-            }
+    pub struct SortedRsa<T>(Vec<T>);
 
-            impl $name {
-                fn new(data: Vec<u8>) -> Self {
-                    Self { data, noise: generate_noise() }
-                }
-            }
-        };
+    impl<T: GetRsaPublicKey> SortedRsa<T> {
+        pub fn new(mut voters: Vec<T>) -> Self {
+            voters.sort_by(|a, b| {
+                let a_p = a.get_public_key().get_product_number();
+                let b_p = b.get_public_key().get_product_number();
+                a_p.cmp(&b_p)
+            });
+            Self(voters)
+        }
     }
-
-    complex_wrap_data!(FirstWrapData);
-    complex_wrap_data!(ThirdWrapData);
-
-    macro_rules! simple_wrap_data {
-        ($name:ident) => {
-            #[derive(Serialize, Deserialize)]
-            struct $name (Vec<BigUint>);
-        };
-    }
-
-    simple_wrap_data!(SecondWrapData);
-    simple_wrap_data!(FourthWrapData);
 
     #[derive(Error, Debug)]
     pub enum CipherError {
@@ -445,20 +431,15 @@ mod voter {
         #[error(transparent)]
         SerializeCandidate(bincode::Error),
         #[error(transparent)]
-        SerializeFirstWrapData(bincode::Error),
+        FirstStageCipherData(rsa::CipherDataError),
         #[error(transparent)]
-        CipherSecondWrapData(rsa::CipherDataError),
+        SerializeFirstStageCipherData(bincode::Error),
         #[error(transparent)]
-        SerializeSecondWrapData(bincode::Error),
-        #[error(transparent)]
-        SerializeThirdWrapData(bincode::Error),
-        #[error(transparent)]
-        CipherThirdWrapData(rsa::CipherDataError),
-        #[error(transparent)]
-        SerializeFourthWrapData(bincode::Error),
+        SecondStageCipherData(rsa::CipherDataError),
     }
 
-    pub struct VoteData(Vec<u8>);
+    struct FirstStageCipherData(Vec<BigUint>);
+    struct SecondStageCipherData(Vec<BigUint>);
 
     #[derive(Error, Debug)]
     pub enum DecipherFourthThirdError {
@@ -474,47 +455,46 @@ mod voter {
 
     impl Voter {
 
-        pub fn cipher<'a, T, I>(&self, candidates: &[Candidate], voters: I) -> Result<VoteData, CipherError>
+        pub fn cipher<T>(
+            &self,
+            candidates: &[Candidate],
+            voters: &SortedRsa<T>,
+            noise_length: usize
+        ) -> Result<SecondStageCipherData, CipherError>
             where
-                T: GetRsaPublicKey + 'a,
-                I: Iterator<Item=&'a T> + Clone,
+                T: GetRsaPublicKey
         {
-
-            let cipher_data = {
-                let candidate = candidates.iter().choose(&mut rand::thread_rng())
-                    .ok_or(CipherError::CanNotChooseCandidate)?;
-                let data = bincode::serialize(&candidate)
-                    .map_err(CipherError::SerializeCandidate)?;
-                bincode::serialize(&FirstWrapData::new(data))
-                    .map_err(CipherError::SerializeFirstWrapData)?
-            };
-
-            let cipher_data = voters.clone().try_fold(cipher_data , |acc, fold| {
-                rsa::cipher_data_u8(&fold.get_public_key(), &acc)
-                    .map_err(CipherError::CipherSecondWrapData)
-                    .map(SecondWrapData)
-                    .and_then(|v| {
-                        bincode::serialize(&v)
-                            .map_err(CipherError::SerializeSecondWrapData)
-                    })
-            })?;
-
-            let cipher_third_fourth_data = || -> Result<VoteData, CipherError> {
-                Ok(
-                    VoteData(
-                        voters.clone().try_fold(cipher_data, |acc, fold| {
-                            let data = bincode::serialize(&ThirdWrapData::new(acc))
-                                .map_err(CipherError::SerializeThirdWrapData)?;
-                            let ciph_data = rsa::cipher_data_u8(&fold.get_public_key(), &data)
-                                .map_err(CipherError::CipherThirdWrapData)?;
-                            bincode::serialize(&FourthWrapData(ciph_data))
-                                .map_err(CipherError::SerializeFourthWrapData)
-                        })?
+            let ser_first_stage_cipher_data = {
+                let first_stage_cipher_data = {
+                    let cipher_data = {
+                        let candidate = candidates.iter().choose(&mut rand::thread_rng())
+                            .ok_or(CipherError::CanNotChooseCandidate)?;
+                        bincode::serialize(&candidate)
+                            .map_err(CipherError::SerializeCandidate)?
+                            .into_iter()
+                            .map(|v| BigUint::from_u8(v).unwrap())
+                            .chain(create_noise_it(noise_length))
+                            .collect::<Vec<_>>()
+                    };
+                    FirstStageCipherData(
+                        voters.get_inner().iter()
+                            .try_fold(cipher_data, |acc, fold| {
+                                rsa::cipher_data_biguint(&fold.get_public_key(), acc)
+                                    .map_err(CipherError::FirstStageCipherData)
+                            })?
                     )
-                )
+                };
+                bincode::serialize(&first_stage_cipher_data)
+                    .map_err(CipherError::SerializeCandidate)?
+                    .map(|v| BigUint::from_u8(v).unwrap())
+                    .collect::<Vec<BigUint>>()
             };
 
-            cipher_third_fourth_data()
+            let d = voters.0.iter().try_fold(ser_first_stage_cipher_data,|mut acc, f| {
+                acc.extend(create_noise_it(noise_length));
+                rsa::cipher_data_biguint(&f.get_public_key(), acc)
+                    .map_err(CipherError::SecondStageCipherData)
+            })?;
         }
 
         pub fn decipher_fourth_third(&self, vote_data: &VoteData) -> Result<VoteData, DecipherFourthThirdError> {

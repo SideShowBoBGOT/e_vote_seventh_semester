@@ -411,16 +411,20 @@ mod voter {
         })
     }
 
-    pub struct SortedRsa<T>(Vec<T>);
+    pub struct SortedVoters(Vec<Voter>);
 
-    impl<T: GetRsaPublicKey> SortedRsa<T> {
-        pub fn new(mut voters: Vec<T>) -> Self {
+    impl SortedVoters {
+        pub fn new(mut voters: Vec<Voter>) -> Self {
             voters.sort_by(|a, b| {
-                let a_p = a.get_public_key().get_product_number();
-                let b_p = b.get_public_key().get_product_number();
+                let a_p = a.rsa.get_product_number();
+                let b_p = b.rsa.get_product_number();
                 a_p.cmp(&b_p)
             });
             Self(voters)
+        }
+
+        pub fn get_inner(&self) -> &[Voter] {
+            &self.0
         }
     }
 
@@ -438,31 +442,31 @@ mod voter {
         SecondStageCipherData(rsa::CipherDataError),
     }
 
+    #[derive(Serialize, Deserialize)]
     struct FirstStageCipherData(Vec<BigUint>);
-    struct SecondStageCipherData(Vec<BigUint>);
+
+    #[derive(Serialize, Deserialize)]
+    pub struct SecondStageCipherData(Vec<BigUint>);
 
     #[derive(Error, Debug)]
-    pub enum DecipherFourthThirdError {
+    pub enum DecipherSecondStageError {
+        #[error("Data length {data_length} is shorter than noise {noise_length}")]
+        DataShorterThanNoise {
+            data_length: usize,
+            noise_length: usize,
+        },
         #[error(transparent)]
-        DeserializeFourthWrapData(bincode::Error),
-        #[error(transparent)]
-        DecipherFourthWrapData(rsa::CipherDataError),
-        #[error(transparent)]
-        ConvertToBytes(rsa::ConvertToBytesError),
-        #[error(transparent)]
-        DeserializeThirdWrapData(bincode::Error)
+        CipherData(rsa::CipherDataError),
     }
 
     impl Voter {
 
-        pub fn cipher<T>(
+        pub fn cipher(
             &self,
             candidates: &[Candidate],
-            voters: &SortedRsa<T>,
+            voters: &SortedVoters,
             noise_length: usize
         ) -> Result<SecondStageCipherData, CipherError>
-            where
-                T: GetRsaPublicKey
         {
             let ser_first_stage_cipher_data = {
                 let first_stage_cipher_data = {
@@ -477,7 +481,7 @@ mod voter {
                             .collect::<Vec<_>>()
                     };
                     FirstStageCipherData(
-                        voters.get_inner().iter()
+                        voters.0.iter()
                             .try_fold(cipher_data, |acc, fold| {
                                 rsa::cipher_data_biguint(&fold.get_public_key(), acc)
                                     .map_err(CipherError::FirstStageCipherData)
@@ -486,27 +490,37 @@ mod voter {
                 };
                 bincode::serialize(&first_stage_cipher_data)
                     .map_err(CipherError::SerializeCandidate)?
+                    .into_iter()
                     .map(|v| BigUint::from_u8(v).unwrap())
                     .collect::<Vec<BigUint>>()
             };
-
-            let d = voters.0.iter().try_fold(ser_first_stage_cipher_data,|mut acc, f| {
-                acc.extend(create_noise_it(noise_length));
-                rsa::cipher_data_biguint(&f.get_public_key(), acc)
-                    .map_err(CipherError::SecondStageCipherData)
-            })?;
+            Ok(
+                SecondStageCipherData(
+                    voters.0.iter().try_fold(ser_first_stage_cipher_data,|mut acc, f| {
+                        acc.extend(create_noise_it(noise_length));
+                        rsa::cipher_data_biguint(&f.get_public_key(), acc)
+                            .map_err(CipherError::SecondStageCipherData)
+                    })?
+                )
+            )
         }
 
-        pub fn decipher_fourth_third(&self, vote_data: &VoteData) -> Result<VoteData, DecipherFourthThirdError> {
-            let fourth_data = bincode::deserialize::<FourthWrapData>(&vote_data.0)
-                .map_err(DecipherFourthThirdError::DeserializeFourthWrapData)?;
-            let data = rsa::cipher_data_biguint(&self.rsa.get_private_key_ref(), fourth_data.0)
-                .map_err(DecipherFourthThirdError::DecipherFourthWrapData)?;
-            let bytes = rsa::convert_to_bytes(&data)
-                .map_err(DecipherFourthThirdError::ConvertToBytes)?;
-            let third_data = bincode::deserialize::<ThirdWrapData>(&bytes)
-                .map_err(DecipherFourthThirdError::DeserializeThirdWrapData)?;
-            Ok(VoteData(third_data.data))
+        pub fn decipher_second_stage(
+            &self,
+            vote_data: SecondStageCipherData,
+            noise_length: usize
+        ) -> Result<SecondStageCipherData, DecipherSecondStageError> {
+            let data_length = vote_data.0.len().checked_sub(noise_length)
+                .ok_or(DecipherSecondStageError::DataShorterThanNoise {
+                    data_length: vote_data.0.len(), noise_length
+                })?;
+            Ok(
+                SecondStageCipherData(
+                    rsa::cipher_data_biguint(&self.rsa.get_private_key_ref(), vote_data.0)
+                        .map_err(DecipherSecondStageError::CipherData)?
+                        .into_iter().take(data_length).collect::<Vec<BigUint>>()
+                )
+            )
         }
     }
 
@@ -516,11 +530,13 @@ mod voter {
 fn it_works() {
     let voters = (0..10).into_iter().map(|_| Voter::default())
         .collect::<Vec<_>>();
+    let noise_length = 20usize;
+    let voters = voter::SortedVoters::new(voters);
+
     let candidates = (0..100).into_iter().map(|i| Candidate(i.to_string()))
         .collect::<Vec<_>>();
-
-    let vote_data = voters.iter().map(|v| {
-        v.cipher(&candidates, voters.iter().rev()).unwrap()
+    let vote_data = voters.get_inner().iter().map(|v| {
+        v.cipher(&candidates, &voters, noise_length).unwrap()
     }).collect::<Vec<_>>();
 
 

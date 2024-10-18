@@ -1,4 +1,4 @@
-use crate::voter::Voter;
+use crate::voter::{Candidate, Voter};
 
 mod rsa {
     use std::ops::Rem;
@@ -11,14 +11,15 @@ mod rsa {
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
 
-    pub fn convert_to_bytes<E>(i: &[BigUint]) -> Result<Vec<u8>, E>
-    where
-        E: From<BigUint>
-    {
+    #[derive(Error, Debug)]
+    #[error("Failed convert to byte: {0}")]
+    pub struct ConvertToBytesError(BigUint);
+
+    pub fn convert_to_bytes(i: &[BigUint]) -> Result<Vec<u8>, ConvertToBytesError> {
         i.iter()
             .try_fold(Vec::new(), |mut acc, unit| {
                 unit.to_u8().ok_or_else(|| {
-                    E::from(unit.clone())
+                    ConvertToBytesError(unit.clone())
                 }).map(|byte| {
                     acc.push(byte);
                     acc
@@ -390,7 +391,7 @@ mod voter {
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
-    struct Candidate(String);
+    pub struct Candidate(pub String);
 
     pub trait GetRsaPublicKey {
         fn get_public_key(&self) -> rsa::PublicKeyRef;
@@ -439,20 +440,45 @@ mod voter {
 
     #[derive(Error, Debug)]
     pub enum CipherError {
+        #[error("Can not chose candidate")]
         CanNotChooseCandidate,
+        #[error(transparent)]
         SerializeCandidate(bincode::Error),
+        #[error(transparent)]
         SerializeFirstWrapData(bincode::Error),
+        #[error(transparent)]
         CipherSecondWrapData(rsa::CipherDataError),
+        #[error(transparent)]
         SerializeSecondWrapData(bincode::Error),
+        #[error(transparent)]
         SerializeThirdWrapData(bincode::Error),
+        #[error(transparent)]
         CipherThirdWrapData(rsa::CipherDataError),
+        #[error(transparent)]
         SerializeFourthWrapData(bincode::Error),
+    }
+
+    pub struct VoteData(Vec<u8>);
+
+    #[derive(Error, Debug)]
+    pub enum DecipherFourthThirdError {
+        #[error(transparent)]
+        DeserializeFourthWrapData(bincode::Error),
+        #[error(transparent)]
+        DecipherFourthWrapData(rsa::CipherDataError),
+        #[error(transparent)]
+        ConvertToBytes(rsa::ConvertToBytesError),
+        #[error(transparent)]
+        DeserializeThirdWrapData(bincode::Error)
     }
 
     impl Voter {
 
-        pub fn cipher<T>(&self, candidates: &[Candidate], voters: &[T]) -> Result<(), CipherError>
-            where T: GetRsaPublicKey {
+        pub fn cipher<'a, T, I>(&self, candidates: &[Candidate], voters: I) -> Result<VoteData, CipherError>
+            where
+                T: GetRsaPublicKey + 'a,
+                I: Iterator<Item=&'a T> + Clone,
+        {
 
             let cipher_data = {
                 let candidate = candidates.iter().choose(&mut rand::thread_rng())
@@ -463,7 +489,7 @@ mod voter {
                     .map_err(CipherError::SerializeFirstWrapData)?
             };
 
-            let cipher_data = voters.iter().try_fold(cipher_data , |acc, fold| {
+            let cipher_data = voters.clone().try_fold(cipher_data , |acc, fold| {
                 rsa::cipher_data_u8(&fold.get_public_key(), &acc)
                     .map_err(CipherError::CipherSecondWrapData)
                     .map(SecondWrapData)
@@ -473,20 +499,36 @@ mod voter {
                     })
             })?;
 
-            voters.iter().try_fold(cipher_data , |acc, fold| {
-                let data = bincode::serialize(&ThirdWrapData::new(acc))
-                    .map_err(CipherError::SerializeThirdWrapData)?;
-                let ciph_data = rsa::cipher_data_u8(&fold.get_public_key(), &data)
-                    .map_err(CipherError::CipherThirdWrapData)?;
-                bincode::serialize(&FourthWrapData(ciph_data))
-                    .map_err(CipherError::SerializeFourthWrapData)
-            })?;
+            let cipher_third_fourth_data = || -> Result<VoteData, CipherError> {
+                Ok(
+                    VoteData(
+                        voters.clone().try_fold(cipher_data, |acc, fold| {
+                            let data = bincode::serialize(&ThirdWrapData::new(acc))
+                                .map_err(CipherError::SerializeThirdWrapData)?;
+                            let ciph_data = rsa::cipher_data_u8(&fold.get_public_key(), &data)
+                                .map_err(CipherError::CipherThirdWrapData)?;
+                            bincode::serialize(&FourthWrapData(ciph_data))
+                                .map_err(CipherError::SerializeFourthWrapData)
+                        })?
+                    )
+                )
+            };
 
-            Ok(())
+            cipher_third_fourth_data()
+        }
+
+        pub fn decipher_fourth_third(&self, vote_data: &VoteData) -> Result<VoteData, DecipherFourthThirdError> {
+            let fourth_data = bincode::deserialize::<FourthWrapData>(&vote_data.0)
+                .map_err(DecipherFourthThirdError::DeserializeFourthWrapData)?;
+            let data = rsa::cipher_data_biguint(&self.rsa.get_private_key_ref(), fourth_data.0)
+                .map_err(DecipherFourthThirdError::DecipherFourthWrapData)?;
+            let bytes = rsa::convert_to_bytes(&data)
+                .map_err(DecipherFourthThirdError::ConvertToBytes)?;
+            let third_data = bincode::deserialize::<ThirdWrapData>(&bytes)
+                .map_err(DecipherFourthThirdError::DeserializeThirdWrapData)?;
+            Ok(VoteData(third_data.data))
         }
     }
-
-
 
 }
 
@@ -494,7 +536,12 @@ mod voter {
 fn it_works() {
     let voters = (0..10).into_iter().map(|_| Voter::default())
         .collect::<Vec<_>>();
+    let candidates = (0..100).into_iter().map(|i| Candidate(i.to_string()))
+        .collect::<Vec<_>>();
 
+    let vote_data = voters.iter().map(|v| {
+        v.cipher(&candidates, voters.iter().rev()).unwrap()
+    }).collect::<Vec<_>>();
 
 
 }

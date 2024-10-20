@@ -3,7 +3,7 @@ mod rsa {
     use derive_more::Deref;
     use getset::Getters;
     use lazy_static::lazy_static;
-    use num_bigint::{BigUint, RandBigInt};
+    use num_bigint::{BigUint};
     use num_traits::{One, ToPrimitive, Zero};
     use rand::Rng;
     use serde::{Deserialize, Serialize};
@@ -199,7 +199,10 @@ mod rsa {
 }
 
 mod elgamal {
-    use num_traits::ToPrimitive;
+    use std::hash::{DefaultHasher, Hasher};
+    use std::ops::Rem;
+    use num_bigint::BigUint;
+    use num_traits::{Pow, ToPrimitive};
     use serde::{Deserialize, Serialize};
     use thiserror::Error;
     use num_prime::nt_funcs::is_prime64;
@@ -210,18 +213,22 @@ mod elgamal {
         ((a % n) + n) % n
     }
 
-    pub fn modinv(z: u16, a: u16) -> Option<u16> {
+    #[derive(Error, Debug)]
+    #[error("Can not get inverse: {z}, {a}")]
+    pub struct ModInvError { z: u16, a: u16 }
+
+    pub fn modinv(z: u16, a: u16) -> Result<u16, ModInvError> {
 
         if z == 0 {
-            return None;
+            return Err(ModInvError{z, a});
         }
 
-        if a == 0 || !is_prime64(a as u64) {
-            return None;
+        if a == 0 {
+            return Err(ModInvError{z, a});
         }
 
         if z >= a {
-            return None;
+            return Err(ModInvError{z, a});
         }
 
         let mut i = a;
@@ -239,9 +246,9 @@ mod elgamal {
             y_1 = y;
         }
         if i != 1 {
-            return None;
+            return Err(ModInvError{z, a});
         }
-        Some(positive_mod(y_2, a as i64) as u16)
+        Ok(positive_mod(y_2, a as i64) as u16)
     }
 
     pub fn modpow(base: u64, exp: u64, modulus: u64) -> u64 {
@@ -285,10 +292,20 @@ mod elgamal {
         p: u16,
     }
 
+    fn generate_k(p: u16) -> u16 {
+        rand::thread_rng().gen_range(1..(p - 1))
+    }
+
+    #[derive(Error, Debug)]
+    pub enum VerifyError {
+        #[error("Can not convert to u16: {0}")]
+        CanNotConvertToU16(BigUint)
+    }
+
     impl PublicKey {
         pub fn cipher(&self, data: &[u8]) -> CipheredData {
             let (a, u) = {
-                let k = rand::thread_rng().gen_range(1..(self.p - 1));
+                let k = generate_k(self.p);
                 (
                     modpow(self.g as u64, k as u64, self.p as u64) as u16,
                     modpow(self.y as u64, k as u64, self.p as u64) as u16
@@ -303,12 +320,24 @@ mod elgamal {
                     .collect()
             }
         }
+
+        pub fn verify(&self, data: &[u8], signature: &Signature) -> Result<bool, VerifyError> {
+            let y = BigUint::from(self.y);
+            let r = BigUint::from(signature.r);
+            let left = (y.pow(&r) * r.pow(signature.s)).rem(BigUint::from(self.p)).to_u16().unwrap();
+
+            let m = calculate_hash(data);
+            let right = modpow(self.g as u64, m as u64, self.p as u64) as u16;
+
+            let is_valid = left == right;
+            Ok(is_valid)
+        }
     }
 
     #[derive(Error, Debug)]
     pub enum DecipherError {
         #[error("Can not create inverse")]
-        CanNotCreateInverse{ s: u16, p: u16 },
+        ModInv(ModInvError),
         #[error("Can not convert to byte")]
         CanNotConvertToByte(u16),
     }
@@ -316,14 +345,24 @@ mod elgamal {
     #[derive(Clone)]
     pub struct PrivateKey {
         p: u16,
+        g: u16,
+        y: u16,
         x: u16,
     }
+
+    fn calculate_hash(data: &[u8]) -> u16 {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(data);
+        hasher.finish() as u16
+    }
+
+    pub struct Signature{ r: u16, s: u16 }
 
     impl PrivateKey {
         pub fn decipher(&self, c_data: &CipheredData) -> Result<Vec<u8>, DecipherError> {
             let s_inv = {
                 let s = modpow(c_data.a as u64, self.x as u64, self.p as u64) as u16;
-                modinv(s, self.p).ok_or(DecipherError::CanNotCreateInverse { s, p: self.p })?
+                modinv(s, self.p).map_err(DecipherError::ModInv)?
             };
             c_data.bs.iter().try_fold(Vec::new(), |mut acc, c| {
                 let prob_byte = ((*c as u32 * s_inv as u32) % self.p as u32) as u16;
@@ -331,6 +370,19 @@ mod elgamal {
                 acc.push(byte);
                 Ok(acc)
             })
+        }
+
+        pub fn sign(&self, data: &[u8]) -> Signature {
+            let m = calculate_hash(data);
+            let (k, k_inv) = loop {
+                let k = generate_k(self.p);
+                if let Ok(k_inv) = modinv(k, self.p - 1) {
+                    break (k, k_inv);
+                }
+            };
+            let r = modpow(self.g as u64, k as u64, self.p as u64) as i64;
+            let s = positive_mod ((m as i64 - (self.x as i64) * r) * (k_inv as i64), self.p as i64 - 1);
+            Signature { r: r as u16, s: s as u16 }
         }
     }
 
@@ -346,7 +398,7 @@ mod elgamal {
             let g = gen_prime(1..p);
             let x = rand::thread_rng().gen_range(1..(p - 2));
             let y = modpow(g as u64, x as u64, p as u64) as u16;
-            Self { public_key: PublicKey { g, y, p }, private_key: PrivateKey { p, x } }
+            Self { public_key: PublicKey { g, y, p }, private_key: PrivateKey { p, g, y, x } }
         }
     }
 
@@ -372,6 +424,15 @@ mod elgamal {
                 let c = b % a;
                 assert_eq!(c, 1);
             }
+        }
+
+        #[test]
+        fn sign_verify() {
+            let message = "message";
+            let key_pair = super::KeyPair::default();
+            let signature = key_pair.private_key.sign(message.as_bytes());
+            let is_valid = key_pair.public_key.verify(message.as_ref(), &signature).unwrap();
+            assert!(is_valid);
         }
     }
 }
@@ -433,15 +494,13 @@ mod voter {
         #[error(transparent)]
         FirstStageCipherData(rsa::CipherDataError),
         #[error(transparent)]
-        SerializeFirstStageCipherData(bincode::Error),
-        #[error(transparent)]
         SecondStageCipherData(rsa::CipherDataError),
     }
 
     #[derive(Serialize, Deserialize)]
     struct FirstStageCipherData(Vec<BigUint>);
 
-    pub fn cipher(
+    fn cipher(
         candidates: &[Candidate],
         voters: &[Voter],
         noise_length: usize,
@@ -556,6 +615,23 @@ mod voter {
             })
     }
 
+    // fn decipher_sign_first_stage(
+    //     voters: &[Voter],
+    //     mut first_stage_cipher_data_vec: Vec<FirstStageCipherData>,
+    //     mut first_stage_noise_vec: Vec<FirstStageNoise>
+    // ) {
+        // for v in voters.windows(2) {
+        //     let cur = &v[0];
+        //     let next = &v[1];
+        //     for cipher_data in &mut first_stage_cipher_data_vec {
+        //         cipher_data.0 = rsa::cipher_data_biguint
+        //             (&cur.rsa.get_private_key_ref(), mem::take(&mut cipher_data.0)
+        //         ).unwrap();
+        //         cur.elgamal.
+        //     }
+        // }
+    // }
+
     #[cfg(test)]
     mod tests {
         use std::mem;
@@ -590,7 +666,11 @@ mod voter {
                 (first_stage_noises, second_stage_noises_table, second_stage_cipher_data_vec)
             };
 
-            decipher_second_stage(&voters, second_stage_cipher_data_vec, second_stage_noise_table).unwrap();
+            let first_stage_cipher_vec = decipher_second_stage(
+                &voters, second_stage_cipher_data_vec, second_stage_noise_table
+            ).unwrap();
+
+
         }
     }
 

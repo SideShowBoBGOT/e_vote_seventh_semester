@@ -296,12 +296,6 @@ mod elgamal {
         rand::thread_rng().gen_range(1..(p - 1))
     }
 
-    #[derive(Error, Debug)]
-    pub enum VerifyError {
-        #[error("Can not convert to u16: {0}")]
-        CanNotConvertToU16(BigUint)
-    }
-
     impl PublicKey {
         pub fn cipher(&self, data: &[u8]) -> CipheredData {
             let (a, u) = {
@@ -321,7 +315,7 @@ mod elgamal {
             }
         }
 
-        pub fn verify(&self, data: &[u8], signature: &Signature) -> Result<bool, VerifyError> {
+        pub fn verify(&self, data: &[u8], signature: &Signature) -> bool {
             let y = BigUint::from(self.y);
             let r = BigUint::from(signature.r);
             let left = (y.pow(&r) * r.pow(signature.s)).rem(BigUint::from(self.p)).to_u16().unwrap();
@@ -330,7 +324,7 @@ mod elgamal {
             let right = modpow(self.g as u64, m as u64, self.p as u64) as u16;
 
             let is_valid = left == right;
-            Ok(is_valid)
+            is_valid
         }
     }
 
@@ -431,7 +425,7 @@ mod elgamal {
             let message = "message";
             let key_pair = super::KeyPair::default();
             let signature = key_pair.private_key.sign(message.as_bytes());
-            let is_valid = key_pair.public_key.verify(message.as_ref(), &signature).unwrap();
+            let is_valid = key_pair.public_key.verify(message.as_ref(), &signature);
             assert!(is_valid);
         }
     }
@@ -474,7 +468,7 @@ mod voter {
     #[derive(Default)]
     struct SecondStageCipherData(Vec<BigUint>);
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
     pub struct Candidate(pub String);
 
     pub fn sort_voters(voters: &mut Vec<Voter>) {
@@ -560,14 +554,35 @@ mod voter {
         SecondStageNoiseRowEmpty,
         #[error(transparent)]
         CipherData(rsa::CipherDataError),
-        #[error("Decrypted data {data_len} is shorter than noise {noise_len}")]
-        DecryptedDataShorterThanNoise { data_len: usize, noise_len: usize },
-        #[error("Noises does not match: {0}, {1}")]
-        NoisesMismatch(BigUint, BigUint),
+        #[error(transparent)]
+        RemoveNoise(RemoveNoiseError),
         #[error("Can not convert to byte: {0}")]
         CantConvertToByte(BigUint),
         #[error(transparent)]
         DeserializeFirstStageCipherData(bincode::Error),
+    }
+
+    #[derive(Error, Debug)]
+    pub enum RemoveNoiseError {
+        #[error("Decrypted data {data_len} is shorter than noise {noise_len}")]
+        DataShorterThanNoise { data_len: usize, noise_len: usize },
+        #[error("Noises does not match: {0}, {1}")]
+        NoisesMismatch(BigUint, BigUint),
+    }
+
+    fn remove_noise(data: Vec<BigUint>, noise: &[BigUint]) -> Result<Vec<BigUint>, RemoveNoiseError> {
+        if data.len() < noise.len() {
+            Err(RemoveNoiseError::DataShorterThanNoise {
+                data_len: data.len(), noise_len: noise.len()
+            })
+        } else {
+            for (a, b) in noise.iter().rev().zip(data.iter().rev()) {
+                if a != b {
+                    return Err(RemoveNoiseError::NoisesMismatch(a.clone(), b.clone()));
+                }
+            }
+            Ok(data.into_iter().rev().skip(noise.len()).rev().collect())
+        }
     }
 
     fn decipher_second_stage(
@@ -586,19 +601,8 @@ mod voter {
                         .and_then(|noise| {
                             let decrypted_data = rsa::cipher_data_biguint(&private_key, data)
                                 .map_err(DecipherSecondStageError::CipherData)?;
-
-                            if decrypted_data.len() < noise.0.len() {
-                                Err(DecipherSecondStageError::DecryptedDataShorterThanNoise {
-                                    data_len: decrypted_data.len(), noise_len: noise.0.len()
-                                })
-                            } else {
-                                for (a, b) in noise.0.iter().rev().zip(decrypted_data.iter().rev()) {
-                                    if a != b {
-                                        return Err(DecipherSecondStageError::NoisesMismatch(a.clone(), b.clone()));
-                                    }
-                                }
-                                Ok(decrypted_data.into_iter().rev().skip(noise.0.len()).rev().collect())
-                            }
+                            remove_noise(decrypted_data, &noise.0)
+                                .map_err(DecipherSecondStageError::RemoveNoise)
                         })
                 })?;
 
@@ -615,36 +619,52 @@ mod voter {
             })
     }
 
-    // fn decipher_sign_first_stage(
-    //     voters: &[Voter],
-    //     mut first_stage_cipher_data_vec: Vec<FirstStageCipherData>,
-    //     mut first_stage_noise_vec: Vec<FirstStageNoise>
-    // ) {
-        // for v in voters.windows(2) {
-        //     let cur = &v[0];
-        //     let next = &v[1];
-        //     for cipher_data in &mut first_stage_cipher_data_vec {
-        //         cipher_data.0 = rsa::cipher_data_biguint
-        //             (&cur.rsa.get_private_key_ref(), mem::take(&mut cipher_data.0)
-        //         ).unwrap();
-        //         cur.elgamal.
-        //     }
-        // }
-    // }
+    fn decipher_sign_first_stage(
+        voters: &[Voter],
+        mut first_stage_cipher_data_vec: Vec<FirstStageCipherData>,
+        first_stage_noise_vec: Vec<FirstStageNoise>
+    ) -> Vec<Candidate> {
+        for v in voters.iter().rev() {
+            for cipher_data in &mut first_stage_cipher_data_vec {
+                cipher_data.0 = rsa::cipher_data_biguint
+                    (&v.rsa.get_private_key_ref(), mem::take(&mut cipher_data.0)
+                ).expect("Can not cipher data");
+                let byte_data = bincode::serialize(&cipher_data.0).unwrap();
+                let signature = v.elgamal.private_key.sign(&byte_data);
+                assert!(
+                    v.elgamal.public_key.verify(&byte_data, &signature),
+                    "Invalid signature"
+                );
+            }
+        }
+        first_stage_cipher_data_vec.into_iter().rev().zip(first_stage_noise_vec.into_iter())
+            .fold(Vec::new(), |mut acc, (first_stage_cipher_data, noise)| {
+                let data = remove_noise(first_stage_cipher_data.0, &noise.0)
+                    .expect("Can not remove noise")
+                    .into_iter()
+                    .map(|v| v.to_u8().expect("Can not convert to byte"))
+                    .collect::<Vec<_>>();
+                let candidate = bincode::deserialize::<Candidate>(&data)
+                    .expect("Can not deserialize to candidate");
+                acc.push(candidate);
+                acc
+            })
+    }
 
     #[cfg(test)]
     mod tests {
+        use std::collections::HashMap;
         use std::mem;
-        use crate::voter::{cipher, decipher_second_stage, sort_voters, Candidate, SecondStageNoiseTable, Voter};
+        use crate::voter::{cipher, decipher_second_stage, decipher_sign_first_stage, sort_voters, Candidate, SecondStageNoiseTable, Voter};
 
         #[test]
         fn it_works() {
             let noise_length = 5usize;
 
-            let mut voters = (0..10).into_iter().map(|_| Voter::default())
+            let mut voters = (0..15).into_iter().map(|_| Voter::default())
                 .collect::<Vec<_>>();
             sort_voters(&mut voters);
-            let candidates = (0..100).into_iter().map(|i| Candidate(i.to_string()))
+            let candidates = (0..5).into_iter().map(|i| Candidate(i.to_string()))
                 .collect::<Vec<_>>();
 
             let (first_stage_noises, mut second_stage_noise_table, second_stage_cipher_data_vec) = {
@@ -670,7 +690,17 @@ mod voter {
                 &voters, second_stage_cipher_data_vec, second_stage_noise_table
             ).unwrap();
 
+            let votes = decipher_sign_first_stage(&voters, first_stage_cipher_vec, first_stage_noises);
 
+            let mut candidates_votes: HashMap<Candidate, u64> = HashMap::from_iter(
+                candidates.into_iter().map(|candidate| (candidate, 0u64))
+            );
+
+            for v in votes {
+                *candidates_votes.get_mut(&v).unwrap() += 1;
+            }
+
+            println!("{:?}", candidates_votes);
         }
     }
 

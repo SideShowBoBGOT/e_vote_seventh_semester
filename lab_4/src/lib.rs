@@ -379,7 +379,7 @@ mod elgamal {
 mod voter {
     use std::mem;
     use num_bigint::BigUint;
-    use num_traits::FromPrimitive;
+    use num_traits::{FromPrimitive, ToPrimitive};
     use rand::prelude::IteratorRandom;
     use rand::Rng;
     use serde::{Deserialize, Serialize};
@@ -413,16 +413,41 @@ mod voter {
     #[derive(Default)]
     struct SecondStageCipherData(Vec<BigUint>);
 
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Candidate(pub String);
 
-    pub fn first_stage_cipher<'a, I>(
+    pub fn sort_voters(voters: &mut Vec<Voter>) {
+        voters.sort_by(|a, b| {
+            let a_p = a.rsa.get_product_number();
+            let b_p = b.rsa.get_product_number();
+            a_p.cmp(&b_p)
+        });
+    }
+
+    #[derive(Error, Debug)]
+    pub enum CipherError {
+        #[error("Can not chose candidate")]
+        CanNotChooseCandidate,
+        #[error(transparent)]
+        SerializeCandidate(bincode::Error),
+        #[error(transparent)]
+        FirstStageCipherData(rsa::CipherDataError),
+        #[error(transparent)]
+        SerializeFirstStageCipherData(bincode::Error),
+        #[error(transparent)]
+        SecondStageCipherData(rsa::CipherDataError),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct FirstStageCipherData(Vec<BigUint>);
+
+    pub fn cipher(
         candidates: &[Candidate],
-        pub_keys: I,
+        voters: &[Voter],
         noise_length: usize,
         mut second_stage_noise_table: SecondStageNoiseTable,
-    ) -> Result<(FirstStageNoise, SecondStageNoiseTable, SecondStageCipherData), CipherError>
-        where
-            I: Iterator<Item = rsa::PublicKeyRef<'a>> + Clone {
-
+    ) -> Result<(FirstStageNoise, SecondStageNoiseTable, SecondStageCipherData), CipherError> {
+        let pub_keys = voters.iter().map(|v| v.rsa.get_public_key_ref());
         let (first_stage_noise, mut ser_first_stage_cipher_data) = {
             let (first_stage_noise, first_stage_cipher_data) = {
                 let (cipher_data, first_stage_noise) = {
@@ -470,41 +495,71 @@ mod voter {
 
         Ok((first_stage_noise, second_stage_noise_table, SecondStageCipherData(ser_first_stage_cipher_data)))
     }
-
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub struct Candidate(pub String);
-
-    pub fn sort_voters(voters: &mut Vec<Voter>) {
-        voters.sort_by(|a, b| {
-            let a_p = a.rsa.get_product_number();
-            let b_p = b.rsa.get_product_number();
-            a_p.cmp(&b_p)
-        });
-    }
-
     #[derive(Error, Debug)]
-    pub enum CipherError {
-        #[error("Can not chose candidate")]
-        CanNotChooseCandidate,
+    pub enum DecipherSecondStageError {
+        #[error("Second stage noise row is empty")]
+        SecondStageNoiseRowEmpty,
         #[error(transparent)]
-        SerializeCandidate(bincode::Error),
+        CipherData(rsa::CipherDataError),
+        #[error("Decrypted data {data_len} is shorter than noise {noise_len}")]
+        DecryptedDataShorterThanNoise { data_len: usize, noise_len: usize },
+        #[error("Noises does not match: {0}, {1}")]
+        NoisesMismatch(BigUint, BigUint),
+        #[error("Can not convert to byte: {0}")]
+        CantConvertToByte(BigUint),
         #[error(transparent)]
-        FirstStageCipherData(rsa::CipherDataError),
-        #[error(transparent)]
-        SerializeFirstStageCipherData(bincode::Error),
-        #[error(transparent)]
-        SecondStageCipherData(rsa::CipherDataError),
+        DeserializeFirstStageCipherData(bincode::Error),
     }
 
-    #[derive(Serialize, Deserialize)]
-    struct FirstStageCipherData(Vec<BigUint>);
+    fn decipher_second_stage(
+        voters: &[Voter],
+        second_stage_cipher_data_vec: Vec<SecondStageCipherData>,
+        mut second_stage_noise_table: SecondStageNoiseTable,
+    ) -> Result<Vec<FirstStageCipherData>, DecipherSecondStageError> {
+        let private_keys = voters.iter().map(|v| v.rsa.get_private_key_ref());
+
+        second_stage_cipher_data_vec.into_iter().rev()
+            .try_fold(Vec::new(), |mut acc, second_stage_cipher_data| {
+                let data = private_keys.clone().zip(
+                    second_stage_noise_table.0.iter_mut()
+                ).rev().try_fold(second_stage_cipher_data.0, |data, (private_key, row)| {
+                    row.0.pop().ok_or(DecipherSecondStageError::SecondStageNoiseRowEmpty)
+                        .and_then(|noise| {
+                            let decrypted_data = rsa::cipher_data_biguint(&private_key, data)
+                                .map_err(DecipherSecondStageError::CipherData)?;
+
+                            if decrypted_data.len() < noise.0.len() {
+                                Err(DecipherSecondStageError::DecryptedDataShorterThanNoise {
+                                    data_len: decrypted_data.len(), noise_len: noise.0.len()
+                                })
+                            } else {
+                                for (a, b) in noise.0.iter().rev().zip(decrypted_data.iter().rev()) {
+                                    if a != b {
+                                        return Err(DecipherSecondStageError::NoisesMismatch(a.clone(), b.clone()));
+                                    }
+                                }
+                                Ok(decrypted_data.into_iter().rev().skip(noise.0.len()).rev().collect())
+                            }
+                        })
+                })?;
+
+                let byte_data = data.into_iter().try_fold(Vec::new(), |mut acc, v| {
+                    let byte = v.to_u8().ok_or(DecipherSecondStageError::CantConvertToByte(v.clone()))?;
+                    acc.push(byte);
+                    Ok(acc)
+                })?;
+                acc.push(
+                    bincode::deserialize::<FirstStageCipherData>(&byte_data)
+                        .map_err(DecipherSecondStageError::DeserializeFirstStageCipherData)?
+                );
+                Ok(acc)
+            })
+    }
 
     #[cfg(test)]
     mod tests {
         use std::mem;
-        use num_traits::ToPrimitive;
-        use crate::rsa;
-        use crate::voter::{first_stage_cipher, sort_voters, Candidate, FirstStageCipherData, SecondStageNoiseTable, Voter};
+        use crate::voter::{cipher, decipher_second_stage, sort_voters, Candidate, SecondStageNoiseTable, Voter};
 
         #[test]
         fn it_works() {
@@ -513,58 +568,29 @@ mod voter {
             let mut voters = (0..10).into_iter().map(|_| Voter::default())
                 .collect::<Vec<_>>();
             sort_voters(&mut voters);
-
             let candidates = (0..100).into_iter().map(|i| Candidate(i.to_string()))
                 .collect::<Vec<_>>();
 
-            let (first_stage_noises, mut second_stage_noise_table, second_stage_cipher_datas) = {
+            let (first_stage_noises, mut second_stage_noise_table, second_stage_cipher_data_vec) = {
                 let mut first_stage_noises = Vec::new();
                 let mut second_stage_noises_table = SecondStageNoiseTable(
                     vec![Default::default(); voters.len()]
                 );
-                let mut second_stage_cipher_datas = Vec::new();
-                let public_keys = voters.iter().map(|v| v.rsa.get_public_key_ref());
+                let mut second_stage_cipher_data_vec = Vec::new();
 
                 for _ in &voters {
-                    let res = first_stage_cipher(
-                        &candidates, public_keys.clone(),
+                    let res = cipher(
+                        &candidates, &voters,
                         noise_length, mem::take(&mut second_stage_noises_table)
                     ).unwrap();
                     first_stage_noises.push(res.0);
                     second_stage_noises_table = res.1;
-                    second_stage_cipher_datas.push(res.2);
+                    second_stage_cipher_data_vec.push(res.2);
                 }
-                (first_stage_noises, second_stage_noises_table, second_stage_cipher_datas)
+                (first_stage_noises, second_stage_noises_table, second_stage_cipher_data_vec)
             };
 
-            {
-                let private_keys = voters.iter().map(|v| v.rsa.get_private_key_ref());
-
-                let first_stage_cipher_data_vec = second_stage_cipher_datas.into_iter().rev()
-                    .fold(Vec::new(), |mut acc, second_stage_cipher_data| {
-                        let data = private_keys.clone().zip(
-                            second_stage_noise_table.0.iter_mut()
-                                .map(|row| row.0.pop().unwrap())
-                        ).rev().fold(second_stage_cipher_data.0, |data, (private_key, noise)| {
-
-                            let decrypted_data = rsa::cipher_data_biguint(&private_key, data).unwrap();
-
-                            assert!(decrypted_data.len() > noise.0.len());
-                            for (a, b) in noise.0.iter().rev().zip(decrypted_data.iter().rev()) {
-                                assert_eq!(a, b)
-                            }
-
-                            decrypted_data.into_iter().rev().skip(noise.0.len()).rev().collect()
-                        });
-
-                        let byte_data = data.into_iter()
-                            .map(|v| v.to_u8().unwrap())
-                            .collect::<Vec<_>>();
-                        acc.push(bincode::deserialize::<FirstStageCipherData>(&byte_data).unwrap());
-                        acc
-                    });
-            }
-
+            decipher_second_stage(&voters, second_stage_cipher_data_vec, second_stage_noise_table).unwrap();
         }
     }
 

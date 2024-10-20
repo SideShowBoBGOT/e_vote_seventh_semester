@@ -1,3 +1,5 @@
+extern crate derive_more;
+
 mod alg_utils {
     use num_prime::nt_funcs::is_prime64;
     use rand::distributions::uniform::SampleRange;
@@ -88,6 +90,7 @@ mod alg_utils {
 mod dsa {
     use std::hash::{DefaultHasher, Hasher};
     use std::ops::Rem;
+    use getset::Getters;
     use rand::Rng;
     use crate::alg_utils::{gen_prime, modinv, modpow};
     use num_prime::nt_funcs::is_prime64;
@@ -114,43 +117,55 @@ mod dsa {
         y: u64,
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug)]
     pub struct Signature {
         r: u16,
         s: u16,
     }
 
-    pub fn create_keys() -> (PublicKey, PrivateKey) {
-        let (q, p) = 'qp_loop: loop {
-            const N: usize = 16;
-            const MIN: u16 = (1 << (N - 1)) as u16;
-            const MAX: u16 = ((1 << N) - 1) as u16;
-            let q = gen_prime(MIN..MAX);
-            let mut p_1 = (q as u64) * 2;
-            loop {
-                if u64::MAX - p_1 < q as u64 {
-                    continue 'qp_loop;
+    #[derive(Getters)]
+    #[get = "pub with_prefix"]
+    pub struct KeyPair {
+        public_key: PublicKey,
+        private_key: PrivateKey,
+    }
+
+    impl Default for KeyPair {
+        fn default() -> Self {
+            let (q, p) = 'qp_loop: loop {
+                const N: usize = 16;
+                const MIN: u16 = (1 << (N - 1)) as u16;
+                const MAX: u16 = ((1 << N) - 1) as u16;
+                let q = gen_prime(MIN..MAX);
+                let mut p_1 = (q as u64) * 2;
+                loop {
+                    if u64::MAX - p_1 < q as u64 {
+                        continue 'qp_loop;
+                    }
+                    let p = p_1 + 1;
+                    if is_prime64(p) && p_1 % q as u64 == 0 {
+                        break 'qp_loop (q, p);
+                    }
+                    p_1 += q as u64;
                 }
-                let p = p_1 + 1;
-                if is_prime64(p) && p_1 % q as u64 == 0 {
-                    break 'qp_loop (q, p);
+            };
+
+            let g = loop {
+                let h = rand::thread_rng().gen_range(1..p-1);
+                let g = modpow(h, (p - 1) / q as u64, p);
+                if g > 1 {
+                    break g;
                 }
-                p_1 += q as u64;
+            };
+
+            let x = rand::thread_rng().gen_range(0..q);
+            let y = modpow(g, x as u64, p);
+
+            KeyPair{
+                public_key: PublicKey { q, p, g, y },
+                private_key: PrivateKey { q, p, g, x }
             }
-        };
-
-        let g = loop {
-            let h = rand::thread_rng().gen_range(1..p-1);
-            let g = modpow(h, (p - 1) / q as u64, p);
-            if g > 1 {
-                break g;
-            }
-        };
-
-        let x = rand::thread_rng().gen_range(0..q);
-        let y = modpow(g, x as u64, p);
-
-        (PublicKey { q, p, g, y }, PrivateKey { q, p, g, x })
+        }
     }
 
     impl PrivateKey {
@@ -199,9 +214,9 @@ mod dsa {
         #[test]
         fn it_works() {
             let message = "message";
-            let (public_key, private_key) = super::create_keys();
-            let signature = private_key.sign(message.as_bytes());
-            let res = public_key.verify(&signature, message.as_bytes());
+            let key_pair = super::KeyPair::default();
+            let signature = key_pair.private_key.sign(message.as_bytes());
+            let res = key_pair.public_key.verify(&signature, message.as_bytes());
             assert!(res);
         }
     }
@@ -385,6 +400,18 @@ mod rsa {
         })
     }
 
+    pub fn cipher_data_u8_arr<const N: usize>(
+        key: &impl KeyRef, data: &[u8; N]
+    ) -> Result<[BigUint; N], CipherDataError> {
+        let (part, product_number) = key.get_parts();
+
+        let mut res: [BigUint; N] = std::array::from_fn(|_| Default::default());
+        for (r, d) in res.iter_mut().zip(data.iter()) {
+            *r = modpow(&BigUint::from(*d), part, product_number)?;
+        }
+        Ok(res)
+    }
+
     #[cfg(test)]
     mod tests {
         use num_traits::ToPrimitive;
@@ -403,6 +430,203 @@ mod rsa {
             let deciphered_message = String::from_utf8(deciphered_data).unwrap();
             assert_eq!(deciphered_message, message);
             println!("{}", deciphered_message);
+        }
+    }
+}
+
+mod sim_env {
+
+    mod voter {
+        use num_bigint::BigUint;
+        use rand::prelude::IteratorRandom;
+        use serde::{Deserialize, Serialize};
+        use thiserror::Error;
+        use crate::{dsa, rsa};
+        use crate::sim_env::cec::{Candidate, VoterId};
+        use crate::sim_env::cec::ec::Ec;
+
+        pub struct Voter {
+            rsa: rsa::KeyPair,
+            dsa: dsa::KeyPair,
+            id: VoterId
+        }
+
+        #[derive(Error, Debug)]
+        pub enum VoteError {
+            #[error("Candidates are empty")]
+            CandidatesEmpty,
+            #[error(transparent)]
+            CipherData(rsa::CipherDataError),
+            #[error(transparent)]
+            CanNotCipherSecondMul(rsa::CipherDataError),
+            #[error(transparent)]
+            SerializeVoteData(bincode::Error),
+        }
+
+        fn get_multiplicative_pairs(value: u16) -> Vec<[u16; 2]> {
+            let mut pairs = Vec::new();
+            for i in 0..=value {
+                if value % i == 0 {
+                    pairs.push([i, value / i]);
+                }
+            }
+            pairs
+        }
+
+        #[derive(Serialize, Deserialize, Debug)]
+        struct VoteData {
+            mul_part: [BigUint; 2],
+            voter_id: VoterId,
+        }
+
+        struct EcData {
+            vote_data: VoteData,
+            signature: dsa::Signature
+        }
+
+        impl Voter {
+            pub fn new(id: VoterId) -> Self {
+                Self {
+                    id,
+                    rsa: Default::default(),
+                    dsa: Default::default(),
+                }
+            }
+
+            pub fn vote<'a>(
+                &self,
+                candidates: impl Iterator<Item=&'a Candidate>,
+                cec_public_key: &rsa::PublicKeyRef,
+                ecs: &[Ec; 2]
+            ) -> Result<(), VoteError> {
+                let candidate = candidates.choose(&mut rand::thread_rng())
+                    .ok_or(VoteError::CandidatesEmpty)?;
+                let mul_pairs = get_multiplicative_pairs(candidate.get_id().0)
+                    .into_iter().choose(&mut rand::thread_rng()).unwrap();
+                let vote_data_arr: [VoteData; 2] = mul_pairs.into_iter()
+                    .try_fold(Vec::new(), |mut acc, v| {
+                        let mul_part= rsa::cipher_data_u8_arr(cec_public_key, &v.to_be_bytes())
+                            .map_err(VoteError::CipherData)?;
+                        acc.push(VoteData { mul_part, voter_id: self.id });
+                        Ok(acc)
+                    })?.try_into().unwrap();
+                let signatures: [dsa::Signature; 2] = vote_data_arr.iter()
+                    .try_fold(Vec::new(), |mut acc, v| {
+                        let byte_data = bincode::serialize(v).map_err(VoteError::SerializeVoteData)?;
+                        acc.push(self.dsa.get_private_key().sign(&byte_data));
+                        Ok(acc)
+                    })?
+                    .try_into().unwrap();
+
+
+                Ok(())
+
+            }
+        }
+    }
+
+    mod cec {
+        use rand::Rng;
+        use crate::rsa;
+        use derive_more::From;
+        use getset::Getters;
+        use serde::{Serialize, Deserialize};
+
+        #[derive(Getters)]
+        #[getset(get = "pub with_prefix")]
+        pub struct Candidate {
+            name: String,
+            id: CandidateId
+        }
+
+        macro_rules! declare_id {
+            ($name:ident) => {
+                #[derive(
+                    Serialize, Deserialize, Debug,
+                    Eq, PartialEq, Clone, Copy, From, Hash
+                )]
+                pub struct $name (pub u16);
+            };
+        }
+
+        declare_id!(VoterId);
+        declare_id!(CandidateId);
+
+        #[derive(Default)]
+        struct Initialization {
+            voter_ids: Vec<VoterId>,
+            candidate_ids: Vec<CandidateId>
+        }
+
+        #[derive(Default)]
+        struct ActiveVote {
+            rsa: rsa::KeyPair,
+            voter_ids: Vec<VoterId>,
+            candidate_ids: Vec<CandidateId>
+        }
+
+        fn register_id<Id: From<u16> + Copy + PartialEq<Id>>(ids: &mut Vec<Id>) -> Id {
+            loop {
+                let id = Id::from(rand::thread_rng().gen_range(u8::MAX as u16..u16::MAX));
+                if ids.iter().find(|el| (*el).eq(&id)).is_none() {
+                    ids.push(id);
+                    break id;
+                }
+            }
+        }
+
+        impl Initialization {
+            pub fn register_voter(&mut self) -> VoterId {
+                register_id::<VoterId>(&mut self.voter_ids)
+            }
+
+            pub fn register_candidate(&mut self, name: String) -> Candidate {
+                let id = register_id::<CandidateId>(&mut self.candidate_ids);
+                Candidate { name, id }
+            }
+
+            pub fn activate_vote(self) -> ActiveVote {
+                ActiveVote {
+                    candidate_ids: self.candidate_ids,
+                    voter_ids: self.voter_ids,
+                    rsa: Default::default()
+                }
+            }
+        }
+
+        pub mod ec {
+            use std::collections::HashMap;
+            use crate::sim_env::cec::VoterId;
+
+            enum VoteState {
+                NotVoted,
+                Voted
+            }
+
+            pub struct Ec(HashMap<VoterId, VoteState>);
+
+            impl Ec {
+                pub(super) fn new(voter_ids: impl Iterator<Item=VoterId>) -> Self {
+                    Ec(HashMap::from_iter(voter_ids.map(|id| (id, VoteState::NotVoted))))
+                }
+
+                pub fn accept_vote(&mut self, voter_id: VoterId) {
+
+                }
+            }
+        }
+
+    }
+
+    #[cfg(test)]
+    mod tests {
+
+        #[test]
+        fn it_works() {
+            // let mut voters = (0..15).into_iter().map(|_| Voter::default())
+            //     .collect::<Vec<_>>();
+            // let candidates = (0..5).into_iter().map(|i| Candidate(i.to_string()))
+            //     .collect::<Vec<_>>();
         }
     }
 }

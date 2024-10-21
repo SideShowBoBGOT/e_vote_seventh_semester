@@ -284,11 +284,11 @@ mod bbs {
 
     macro_rules! get_last_bit {
         ($v:expr) => {
-            v & 1 == 1
+            $v & 1 == 1
         };
     }
 
-    const fn u8_to_bits(mut v: u8) -> [bool; 8] {
+    fn u8_to_bits(mut v: u8) -> [bool; 8] {
         std::array::from_fn(|_| {
             let b = get_last_bit!(v);
             v >>= 1;
@@ -296,12 +296,11 @@ mod bbs {
         })
     }
 
-    const fn bits_to_u8(bits: [bool; 8]) -> u8 {
+    fn bits_to_u8(bits: [bool; 8]) -> u8 {
         let mut a: u8 = 0;
-        for b in bits {
-            let ba = b as u8;
+        for (i, b) in bits.iter().enumerate() {
+            let ba = (*b as u8) << (i as u8);
             a |= ba;
-            a <<= 1;
         }
         a
     }
@@ -334,7 +333,7 @@ mod bbs {
 
     impl PrivateKey {
         pub fn decipher(&self, data: &mut [u8], x_0: u32) {
-            let lcm_lam = lcm(self.p - 1, self.q - 1);
+            let lcm_lam = lcm((self.p - 1) as u32, (self.q - 1) as u32);
             let n = self.p as u32 * self.q as u32;
             let next_x = |i: usize| {
                 let ppow = modpow(2, i as u64, lcm_lam as u64);
@@ -355,4 +354,26 @@ mod bbs {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use crate::bbs::{bits_to_u8, u8_to_bits};
+
+        #[test]
+        fn bits_u8() {
+            for v in 0..u8::MAX {
+                assert_eq!(bits_to_u8(u8_to_bits(v)), v);
+            }
+        }
+
+        #[test]
+        fn it_works() {
+            let message = "message";
+            let mut c_message = bincode::serialize(&message).unwrap();
+            let key_pair = super::KeyPair::default();
+            let x_0 = key_pair.public_key.cipher(&mut c_message);
+            key_pair.private_key.decipher(&mut c_message, x_0);
+            let original_message: String = bincode::deserialize(&c_message).unwrap();
+            assert_eq!(original_message, message);
+        }
+    }
 }

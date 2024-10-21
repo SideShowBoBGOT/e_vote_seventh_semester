@@ -88,13 +88,13 @@ mod alg_utils {
 
 
 mod dsa {
+    use crate::alg_utils::{gen_prime, modinv, modpow};
+    use getset::Getters;
+    use num_prime::nt_funcs::is_prime64;
+    use rand::Rng;
+    use serde::{Deserialize, Serialize};
     use std::hash::{DefaultHasher, Hasher};
     use std::ops::Rem;
-    use getset::Getters;
-    use rand::Rng;
-    use crate::alg_utils::{gen_prime, modinv, modpow};
-    use num_prime::nt_funcs::is_prime64;
-    use serde::{Deserialize, Serialize};
 
     fn calculate_hash(data: &[u8]) -> u16 {
         let mut hasher = DefaultHasher::new();
@@ -223,14 +223,14 @@ mod dsa {
 }
 
 mod rsa {
-    use std::ops::Rem;
     use derive_more::Deref;
     use getset::Getters;
     use lazy_static::lazy_static;
-    use num_bigint::{BigUint};
+    use num_bigint::BigUint;
     use num_traits::{One, ToPrimitive, Zero};
     use rand::Rng;
     use serde::{Deserialize, Serialize};
+    use std::ops::Rem;
     use thiserror::Error;
 
     #[derive(Error, Debug)]
@@ -424,8 +424,8 @@ mod rsa {
 
     #[cfg(test)]
     mod tests {
-        use num_traits::ToPrimitive;
         use super::{cipher_data_biguint, cipher_data_u8, KeyPair};
+        use num_traits::ToPrimitive;
 
         #[test]
         fn test_ciphering() {
@@ -447,22 +447,21 @@ mod rsa {
 mod sim_env {
 
     mod voter {
+        use crate::sim_env::cec::ec::AcceptVote;
+        use crate::sim_env::cec::{Candidate, VoterId};
+        use crate::{dsa, rsa};
         use num_bigint::BigUint;
         use rand::prelude::IteratorRandom;
         use serde::{Deserialize, Serialize};
-        use crate::{dsa, rsa};
-        use crate::sim_env::cec::{Candidate, VoterId};
-        use crate::sim_env::cec::ec::{Ec, AcceptVote};
 
         pub struct Voter {
-            rsa: rsa::KeyPair,
             dsa: dsa::KeyPair,
             id: VoterId
         }
 
         fn get_multiplicative_pairs(value: u16) -> Vec<[u16; 2]> {
             let mut pairs = Vec::new();
-            for i in 0..=value {
+            for i in 1..=value {
                 if value % i == 0 {
                     pairs.push([i, value / i]);
                 }
@@ -483,7 +482,6 @@ mod sim_env {
             pub fn new(id: VoterId) -> Self {
                 Self {
                     id,
-                    rsa: Default::default(),
                     dsa: Default::default(),
                 }
             }
@@ -509,7 +507,7 @@ mod sim_env {
                 });
                 let signatures: [dsa::Signature; 2] = std::array::from_fn(|i| {
                     self.dsa.get_private_key()
-                        .sign(&bincode::serialize(&vote_data_arr[0]).unwrap())
+                        .sign(&bincode::serialize(&vote_data_arr[i]).unwrap())
                 });
                 for ((vote_data, signature), ec) in vote_data_arr.into_iter()
                     .zip(signatures.iter()).zip(ecs.iter_mut()) {
@@ -520,16 +518,16 @@ mod sim_env {
     }
 
     mod cec {
-        use std::collections::HashMap;
-        use std::mem;
-        use rand::Rng;
         use crate::rsa;
+        use crate::sim_env::cec::ec::{Ec, PublishVotes, VoteState};
         use derive_more::From;
         use getset::Getters;
         use num_integer::Integer;
         use num_traits::ToPrimitive;
-        use serde::{Serialize, Deserialize};
-        use crate::sim_env::cec::ec::{Ec, PublishVotes, VoteState};
+        use rand::Rng;
+        use serde::{Deserialize, Serialize};
+        use std::collections::HashMap;
+        use std::mem;
 
         #[derive(Getters)]
         #[getset(get = "pub with_prefix")]
@@ -542,7 +540,8 @@ mod sim_env {
             ($name:ident) => {
                 #[derive(
                     Serialize, Deserialize, Debug,
-                    Eq, PartialEq, Clone, Copy, From, Hash
+                    Eq, PartialEq, Clone, Copy, From, Hash,
+                    Ord, PartialOrd
                 )]
                 pub struct $name (pub u16);
             };
@@ -552,15 +551,14 @@ mod sim_env {
         declare_id!(CandidateId);
 
         #[derive(Default)]
-        struct Initialization {
+        pub struct Initialization {
             voter_ids: Vec<VoterId>,
             candidate_ids: Vec<CandidateId>
         }
 
         #[derive(Default)]
-        struct ActiveVote {
+        pub struct ActiveVote {
             rsa: rsa::KeyPair,
-            voter_ids: Vec<VoterId>,
             candidate_ids: Vec<CandidateId>
         }
 
@@ -586,10 +584,9 @@ mod sim_env {
 
             pub fn activate_vote(self) -> ([Ec; 2], ActiveVote) {
                 (
-                    std::array::from_fn(|i| Ec::new(self.voter_ids.iter())),
+                    std::array::from_fn(|_| Ec::new(self.voter_ids.iter())),
                     ActiveVote {
                         candidate_ids: self.candidate_ids,
-                        voter_ids: self.voter_ids,
                         rsa: Default::default()
                     },
                 )
@@ -597,11 +594,16 @@ mod sim_env {
         }
 
         impl ActiveVote {
-            pub fn end_vote<T: PublishVotes>(self, ec0: Ec, ec1: Ec) -> HashMap<CandidateId, u64> {
+            pub fn get_public_key(&self) -> rsa::PublicKeyRef {
+                self.rsa.get_public_key_ref()
+            }
+
+            pub fn end_vote<T: PublishVotes + Default>(self, mut ecs: [T; 2]) -> HashMap<CandidateId, u64> {
                 let mut candidates_votes = HashMap::from_iter(
                     self.candidate_ids.iter().map(|id| (*id, 0u64))
                 );
-                ec0.publish_votes().into_iter().zip(ec1.publish_votes().into_iter())
+                mem::take(&mut ecs[0]).publish_votes()
+                    .into_iter().zip(mem::take(&mut ecs[1]).publish_votes().into_iter())
                     .for_each(|(v1, v2)| {
                         assert_eq!(v1.0, v2.0);
                         match (v1.1, v2.1) {
@@ -633,16 +635,17 @@ mod sim_env {
         }
 
         pub mod ec {
-            use std::collections::HashMap;
             use crate::dsa;
             use crate::sim_env::cec::VoterId;
             use crate::sim_env::voter::{MulPart, VoteData};
+            use std::collections::HashMap;
 
             pub enum VoteState {
                 NotVoted,
                 Voted(MulPart)
             }
 
+            #[derive(Default)]
             pub struct Ec(HashMap<VoterId, VoteState>);
 
             pub trait AcceptVote {
@@ -668,7 +671,7 @@ mod sim_env {
                     let vote_state = self.0.get_mut(&vote_data.voter_id)
                         .expect("Voter id must be registered");
                     match vote_state {
-                        VoteState::Voted(data) => {
+                        VoteState::Voted(_) => {
                             panic!("Voter id already voted: {:?}", vote_data.voter_id)
                         },
                         VoteState::NotVoted => {
@@ -679,18 +682,20 @@ mod sim_env {
             }
 
             pub trait  PublishVotes {
-                fn publish_votes(&self) -> &HashMap<VoterId, VoteState>;
+                fn publish_votes(self) -> Vec<(VoterId, VoteState)>;
             }
 
             impl PublishVotes for Ec {
-                fn publish_votes(self) -> HashMap<VoterId, VoteState> {
-                    self.0
+                fn publish_votes(self) -> Vec<(VoterId, VoteState)> {
+                    let mut v: Vec<(VoterId, VoteState)> = self.0.into_iter().collect();
+                    v.sort_by(|v1, v2| v1.0.cmp(&v2.0));
+                    v
                 }
             }
 
             impl Ec {
-                pub(super) fn new(voter_ids: impl Iterator<Item=VoterId>) -> Self {
-                    Ec(HashMap::from_iter(voter_ids.map(|id| (id, VoteState::NotVoted))))
+                pub(super) fn new<'a>(voter_ids: impl Iterator<Item=&'a VoterId>) -> Self {
+                    Ec(HashMap::from_iter(voter_ids.map(|id| (*id, VoteState::NotVoted))))
                 }
             }
         }
@@ -698,13 +703,21 @@ mod sim_env {
 
     #[cfg(test)]
     mod tests {
+        use crate::sim_env::{cec, voter};
 
         #[test]
         fn it_works() {
-            // let mut voters = (0..15).into_iter().map(|_| Voter::default())
-            //     .collect::<Vec<_>>();
-            // let candidates = (0..5).into_iter().map(|i| Candidate(i.to_string()))
-            //     .collect::<Vec<_>>();
+            let mut cec = cec::Initialization::default();
+            let voters: [voter::Voter; 15] = std::array::from_fn(|_| voter::Voter::new(cec.register_voter()));
+            let candidates: [cec::Candidate; 5] = std::array::from_fn(|i| cec.register_candidate(i.to_string()));
+            let (mut ecs, cec) = cec.activate_vote();
+            for v in  &voters {
+                v.vote(candidates.iter(), &cec.get_public_key(), &mut ecs);
+            }
+            let res = cec.end_vote(ecs);
+            for r in res {
+                println!("{:?}", r);
+            }
         }
     }
 }

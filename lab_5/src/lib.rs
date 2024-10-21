@@ -404,12 +404,22 @@ mod rsa {
         key: &impl KeyRef, data: &[u8; N]
     ) -> Result<[BigUint; N], CipherDataError> {
         let (part, product_number) = key.get_parts();
-
         let mut res: [BigUint; N] = std::array::from_fn(|_| Default::default());
         for (r, d) in res.iter_mut().zip(data.iter()) {
             *r = modpow(&BigUint::from(*d), part, product_number)?;
         }
         Ok(res)
+    }
+
+    pub fn cipher_data_biguint_arr<const N: usize>(
+        key: &impl KeyRef, mut data: [BigUint; N]
+    ) -> Result<[BigUint; N], CipherDataError> {
+        let (part, product_number) = key.get_parts();
+        for d in data.iter_mut() {
+            let dn = modpow(&d, part, product_number)?;
+            *d = dn;
+        }
+        Ok(data)
     }
 
     #[cfg(test)]
@@ -440,27 +450,14 @@ mod sim_env {
         use num_bigint::BigUint;
         use rand::prelude::IteratorRandom;
         use serde::{Deserialize, Serialize};
-        use thiserror::Error;
         use crate::{dsa, rsa};
         use crate::sim_env::cec::{Candidate, VoterId};
-        use crate::sim_env::cec::ec::Ec;
+        use crate::sim_env::cec::ec::{Ec, AcceptVote};
 
         pub struct Voter {
             rsa: rsa::KeyPair,
             dsa: dsa::KeyPair,
             id: VoterId
-        }
-
-        #[derive(Error, Debug)]
-        pub enum VoteError {
-            #[error("Candidates are empty")]
-            CandidatesEmpty,
-            #[error(transparent)]
-            CipherData(rsa::CipherDataError),
-            #[error(transparent)]
-            CanNotCipherSecondMul(rsa::CipherDataError),
-            #[error(transparent)]
-            SerializeVoteData(bincode::Error),
         }
 
         fn get_multiplicative_pairs(value: u16) -> Vec<[u16; 2]> {
@@ -474,14 +471,12 @@ mod sim_env {
         }
 
         #[derive(Serialize, Deserialize, Debug)]
-        struct VoteData {
-            mul_part: [BigUint; 2],
-            voter_id: VoterId,
-        }
+        pub struct MulPart(pub [BigUint; 2]);
 
-        struct EcData {
-            vote_data: VoteData,
-            signature: dsa::Signature
+        #[derive(Serialize, Deserialize, Debug)]
+        pub struct VoteData {
+            pub mul_part: MulPart,
+            pub voter_id: VoterId,
         }
 
         impl Voter {
@@ -493,44 +488,48 @@ mod sim_env {
                 }
             }
 
-            pub fn vote<'a>(
+            pub fn vote<'a, T: AcceptVote>(
                 &self,
                 candidates: impl Iterator<Item=&'a Candidate>,
                 cec_public_key: &rsa::PublicKeyRef,
-                ecs: &[Ec; 2]
-            ) -> Result<(), VoteError> {
-                let candidate = candidates.choose(&mut rand::thread_rng())
-                    .ok_or(VoteError::CandidatesEmpty)?;
+                ecs: &mut [T; 2]
+            ) -> () {
+                let candidate = candidates.choose(&mut rand::thread_rng()).unwrap();
                 let mul_pairs = get_multiplicative_pairs(candidate.get_id().0)
                     .into_iter().choose(&mut rand::thread_rng()).unwrap();
-                let vote_data_arr: [VoteData; 2] = mul_pairs.into_iter()
-                    .try_fold(Vec::new(), |mut acc, v| {
-                        let mul_part= rsa::cipher_data_u8_arr(cec_public_key, &v.to_be_bytes())
-                            .map_err(VoteError::CipherData)?;
-                        acc.push(VoteData { mul_part, voter_id: self.id });
-                        Ok(acc)
-                    })?.try_into().unwrap();
-                let signatures: [dsa::Signature; 2] = vote_data_arr.iter()
-                    .try_fold(Vec::new(), |mut acc, v| {
-                        let byte_data = bincode::serialize(v).map_err(VoteError::SerializeVoteData)?;
-                        acc.push(self.dsa.get_private_key().sign(&byte_data));
-                        Ok(acc)
-                    })?
-                    .try_into().unwrap();
-
-
-                Ok(())
-
+                let vote_data_arr: [VoteData; 2] = std::array::from_fn(|i| {
+                    VoteData {
+                        mul_part: MulPart(
+                                rsa::cipher_data_u8_arr(
+                                cec_public_key, &mul_pairs[i].to_be_bytes()
+                            ).unwrap()
+                        ),
+                        voter_id: self.id
+                    }
+                });
+                let signatures: [dsa::Signature; 2] = std::array::from_fn(|i| {
+                    self.dsa.get_private_key()
+                        .sign(&bincode::serialize(&vote_data_arr[0]).unwrap())
+                });
+                for ((vote_data, signature), ec) in vote_data_arr.into_iter()
+                    .zip(signatures.iter()).zip(ecs.iter_mut()) {
+                    ec.accept_vote(vote_data, signature, self.dsa.get_public_key());
+                }
             }
         }
     }
 
     mod cec {
+        use std::collections::HashMap;
+        use std::mem;
         use rand::Rng;
         use crate::rsa;
         use derive_more::From;
         use getset::Getters;
+        use num_integer::Integer;
+        use num_traits::ToPrimitive;
         use serde::{Serialize, Deserialize};
+        use crate::sim_env::cec::ec::{Ec, PublishVotes, VoteState};
 
         #[derive(Getters)]
         #[getset(get = "pub with_prefix")]
@@ -585,37 +584,116 @@ mod sim_env {
                 Candidate { name, id }
             }
 
-            pub fn activate_vote(self) -> ActiveVote {
-                ActiveVote {
-                    candidate_ids: self.candidate_ids,
-                    voter_ids: self.voter_ids,
-                    rsa: Default::default()
-                }
+            pub fn activate_vote(self) -> ([Ec; 2], ActiveVote) {
+                (
+                    std::array::from_fn(|i| Ec::new(self.voter_ids.iter())),
+                    ActiveVote {
+                        candidate_ids: self.candidate_ids,
+                        voter_ids: self.voter_ids,
+                        rsa: Default::default()
+                    },
+                )
+            }
+        }
+
+        impl ActiveVote {
+            pub fn end_vote<T: PublishVotes>(self, ec0: Ec, ec1: Ec) -> HashMap<CandidateId, u64> {
+                let mut candidates_votes = HashMap::from_iter(
+                    self.candidate_ids.iter().map(|id| (*id, 0u64))
+                );
+                ec0.publish_votes().into_iter().zip(ec1.publish_votes().into_iter())
+                    .for_each(|(v1, v2)| {
+                        assert_eq!(v1.0, v2.0);
+                        match (v1.1, v2.1) {
+                            (VoteState::Voted(vd_0), VoteState::Voted(vd_1)) => {
+                                let mut vds = [vd_0, vd_1];
+                                let mul_parts: [u16; 2] = std::array::from_fn(|i| {
+                                    let data = rsa::cipher_data_biguint_arr(
+                                        &self.rsa.get_private_key_ref(), mem::take(&mut vds[i].0)
+                                    ).expect("Failed ciphering data");
+                                    let byte_data: [u8; 2] = std::array::from_fn(|i| {
+                                        data[i].to_u8().unwrap()
+                                    });
+                                    u16::from_be_bytes(byte_data)
+                                });
+
+                                let candidate_id = CandidateId(mul_parts[0] * mul_parts[1]);
+                                if let Some(vote_counter) = candidates_votes.get_mut(&candidate_id) {
+                                    vote_counter.inc();
+                                } else {
+                                    panic!("Invalid candidate id: {:?}", candidate_id);
+                                }
+                            },
+                            _ => panic!("unexpected vote state")
+                        }
+                    }
+                );
+                candidates_votes
             }
         }
 
         pub mod ec {
             use std::collections::HashMap;
+            use crate::dsa;
             use crate::sim_env::cec::VoterId;
+            use crate::sim_env::voter::{MulPart, VoteData};
 
-            enum VoteState {
+            pub enum VoteState {
                 NotVoted,
-                Voted
+                Voted(MulPart)
             }
 
             pub struct Ec(HashMap<VoterId, VoteState>);
+
+            pub trait AcceptVote {
+                fn accept_vote(
+                    &mut self,
+                    vote_data: VoteData,
+                    signature: &dsa::Signature,
+                    public_key: &dsa::PublicKey,
+                );
+            }
+
+            impl AcceptVote for Ec {
+                fn accept_vote(
+                    &mut self,
+                    vote_data: VoteData,
+                    signature: &dsa::Signature,
+                    public_key: &dsa::PublicKey,
+                ) {
+                    assert!(
+                        public_key.verify(signature, &bincode::serialize(&vote_data).unwrap()),
+                        "invalid signature"
+                    );
+                    let vote_state = self.0.get_mut(&vote_data.voter_id)
+                        .expect("Voter id must be registered");
+                    match vote_state {
+                        VoteState::Voted(data) => {
+                            panic!("Voter id already voted: {:?}", vote_data.voter_id)
+                        },
+                        VoteState::NotVoted => {
+                            *vote_state = VoteState::Voted(vote_data.mul_part)
+                        }
+                    }
+                }
+            }
+
+            pub trait  PublishVotes {
+                fn publish_votes(&self) -> &HashMap<VoterId, VoteState>;
+            }
+
+            impl PublishVotes for Ec {
+                fn publish_votes(self) -> HashMap<VoterId, VoteState> {
+                    self.0
+                }
+            }
 
             impl Ec {
                 pub(super) fn new(voter_ids: impl Iterator<Item=VoterId>) -> Self {
                     Ec(HashMap::from_iter(voter_ids.map(|id| (id, VoteState::NotVoted))))
                 }
-
-                pub fn accept_vote(&mut self, voter_id: VoterId) {
-
-                }
             }
         }
-
     }
 
     #[cfg(test)]

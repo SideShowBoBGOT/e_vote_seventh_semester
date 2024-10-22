@@ -523,17 +523,13 @@ mod sim_env {
 
         #[test]
         fn it_works() {
-
-
             let (mut ec, reg_bureau_tokens) = {
                 ec::Ec::accept_ids_generate_tokens(
                     &reg_bureau::send_ids(20),
                     5
                 )
             };
-
             voters::vote(reg_bureau_tokens, &mut ec);
-
             for p in ec.get_candidate_statistic() {
                 println!("{:?}", p);
             }

@@ -447,6 +447,7 @@ mod rsa {
 mod sim_env {
 
     mod voter {
+        use std::mem;
         use crate::sim_env::cec::ec::AcceptVote;
         use crate::sim_env::cec::{Candidate, VoterId};
         use crate::{dsa, rsa};
@@ -459,7 +460,7 @@ mod sim_env {
             id: VoterId
         }
 
-        fn get_multiplicative_pairs(value: u16) -> Vec<[u16; 2]> {
+        fn get_multiplicative_pairs(value: u8) -> Vec<[u8; 2]> {
             let mut pairs = Vec::new();
             for i in 1..=value {
                 if value % i == 0 {
@@ -470,7 +471,7 @@ mod sim_env {
         }
 
         #[derive(Serialize, Deserialize, Debug)]
-        pub struct MulPart(pub [BigUint; 2]);
+        pub struct MulPart(pub BigUint);
 
         #[derive(Serialize, Deserialize, Debug)]
         pub struct VoteData {
@@ -495,12 +496,13 @@ mod sim_env {
                 let candidate = candidates.choose(&mut rand::thread_rng()).unwrap();
                 let mul_pairs = get_multiplicative_pairs(candidate.get_id().0)
                     .into_iter().choose(&mut rand::thread_rng()).unwrap();
+
                 let vote_data_arr: [VoteData; 2] = std::array::from_fn(|i| {
                     VoteData {
                         mul_part: MulPart(
-                                rsa::cipher_data_u8_arr(
-                                cec_public_key, &mul_pairs[i].to_be_bytes()
-                            ).unwrap()
+                            mem::take(
+                                &mut rsa::cipher_data_u8_arr(cec_public_key, &[mul_pairs[i]]).unwrap()[0]
+                            )
                         ),
                         voter_id: self.id
                     }
@@ -528,6 +530,7 @@ mod sim_env {
         use serde::{Deserialize, Serialize};
         use std::collections::HashMap;
         use std::mem;
+        use crate::rsa::KeyRef;
 
         #[derive(Getters)]
         #[getset(get = "pub with_prefix")]
@@ -543,7 +546,7 @@ mod sim_env {
                     Eq, PartialEq, Clone, Copy, From, Hash,
                     Ord, PartialOrd
                 )]
-                pub struct $name (pub u16);
+                pub struct $name (pub u8);
             };
         }
 
@@ -562,9 +565,9 @@ mod sim_env {
             candidate_ids: Vec<CandidateId>
         }
 
-        fn register_id<Id: From<u16> + Copy + PartialEq<Id>>(ids: &mut Vec<Id>) -> Id {
+        fn register_id<Id: From<u8> + Copy + PartialEq<Id>>(ids: &mut Vec<Id>) -> Id {
             loop {
-                let id = Id::from(rand::thread_rng().gen_range(u8::MAX as u16..u16::MAX));
+                let id = Id::from(rand::thread_rng().gen_range(u8::MIN..u8::MAX));
                 if ids.iter().find(|el| (*el).eq(&id)).is_none() {
                     ids.push(id);
                     break id;
@@ -607,23 +610,15 @@ mod sim_env {
                     .for_each(|(v1, v2)| {
                         assert_eq!(v1.0, v2.0);
                         match (v1.1, v2.1) {
-                            (VoteState::Voted(vd_0), VoteState::Voted(vd_1)) => {
-                                let mut vds = [vd_0, vd_1];
-                                let mul_parts: [u16; 2] = std::array::from_fn(|i| {
-                                    let data = rsa::cipher_data_biguint_arr(
-                                        &self.rsa.get_private_key_ref(), mem::take(&mut vds[i].0)
-                                    ).expect("Failed ciphering data");
-                                    let byte_data: [u8; 2] = std::array::from_fn(|i| {
-                                        data[i].to_u8().unwrap()
-                                    });
-                                    u16::from_be_bytes(byte_data)
-                                });
-
-                                let candidate_id = CandidateId(mul_parts[0] * mul_parts[1]);
-                                if let Some(vote_counter) = candidates_votes.get_mut(&candidate_id) {
+                            (VoteState::Voted(mut vd_0), VoteState::Voted(mut vd_1)) => {
+                                let pr = self.rsa.get_private_key_ref();
+                                let (priv_num, prod_num)  = pr.get_parts();
+                                let mut vd = (vd_0.0 * vd_1.0).modpow(priv_num, prod_num);
+                                let id = CandidateId(vd.to_u8().unwrap());
+                                if let Some(vote_counter) = candidates_votes.get_mut(&id) {
                                     vote_counter.inc();
                                 } else {
-                                    panic!("Invalid candidate id: {:?}", candidate_id);
+                                    panic!("Invalid candidate id: {:?}", id);
                                 }
                             },
                             _ => panic!("unexpected vote state")
